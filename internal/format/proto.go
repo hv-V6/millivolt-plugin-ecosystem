@@ -1,0 +1,457 @@
+package format
+
+// Minimal, allocation-conscious Protocol Buffers wire-format primitives.
+//
+// The Cursor upstream speaks Connect-RPC carrying protobuf messages. Rather
+// than pull in a protobuf runtime (and a .proto codegen step) for a handful of
+// fields, we hand-encode/decode the exact wire format. The strict parser
+// accepts the two wire types the Cursor schema uses - varint (0) and
+// length-delimited (2); the Value shim's parser additionally admits the
+// fixed64/fixed32 encodings (see parseProtoFieldsWire).
+//
+// These are internal, non-tunable implementation details.
+
+import (
+	"errors"
+	"fmt"
+	"math"
+)
+
+const (
+	wireVarint = 0 // int32/int64/bool/enum/uint32/uint64
+	wireBytes  = 2 // string/bytes/embedded message
+
+	// protoValueMaxDepth bounds google.protobuf.Value nesting during decode.
+	// The wire costs only ~4-5 bytes per nesting level, so one crafted upstream
+	// frame well under connectMaxFrame (32 MiB) can encode millions of levels;
+	// the mutually recursive Value/Struct/ListValue decode would then exhaust
+	// the goroutine stack, a fatal, unrecoverable process crash from a single
+	// frame. A deeper frame is malformed input denied by default, the same
+	// posture as adminjson's document depth bound. Internal safety guardrail,
+	// not a user-tunable setting.
+	protoValueMaxDepth = 128
+
+	// protoFieldCountMax bounds the fields materialized from one top-level
+	// protobuf frame. A protoField costs 48 bytes while the minimal field on
+	// the wire is 2 bytes, so without this bound a 32 MiB frame
+	// (connectMaxFrame) could allocate ~4 GiB of field structs. 65,536 fields
+	// is far above any legitimate message: the largest tool-argument map is a
+	// repeated map entry carrying at least a tag, length and key per argument,
+	// so 65,536 arguments already require a multi-hundred-KiB object, orders
+	// of magnitude beyond a real tool schema or conversation. The recursive
+	// Value/Struct/List/map decode of one frame shares one budget (see
+	// protoFieldBudget), so a dense nested value cannot reset it per level. A
+	// denser buffer is malformed input and fails closed in both the strict and
+	// lenient parser paths. Internal safety guardrail, not a user-tunable
+	// setting.
+	protoFieldCountMax = 1 << 16
+)
+
+// errProtoFieldCount is the stable fail-closed reason for a frame whose
+// decoded field count would exceed protoFieldCountMax.
+var errProtoFieldCount = errors.New("protobuf: field count limit exceeded")
+
+// protoFieldBudget is the decoded-field budget for one top-level frame. The
+// wire parser and every recursive Value/Struct/List/map decode charge into
+// the same budget, so nesting a container cannot buy a fresh allowance.
+// Budgets are per decode call, never package state, so concurrent frames do
+// not share or race on a count.
+type protoFieldBudget struct {
+	remaining int
+}
+
+// newProtoFieldBudget starts a frame with the full decoded-field allowance.
+func newProtoFieldBudget() *protoFieldBudget {
+	return &protoFieldBudget{remaining: protoFieldCountMax}
+}
+
+// consume charges one decoded field, failing closed once the frame has spent
+// its allowance.
+func (b *protoFieldBudget) consume() error {
+	if b.remaining <= 0 {
+		return fmt.Errorf("%w (limit %d)", errProtoFieldCount, protoFieldCountMax)
+	}
+	b.remaining--
+	return nil
+}
+
+// appendVarint encodes v as a base-128 varint (little-endian groups, 7 bits
+// per byte, continuation bit set on all but the last).
+func appendVarint(dst []byte, v uint64) []byte {
+	for v >= 0x80 {
+		dst = append(dst, byte(v)|0x80)
+		v >>= 7
+	}
+	return append(dst, byte(v))
+}
+
+// appendTag writes the field key: (fieldNumber << 3) | wireType.
+func appendTag(dst []byte, field, wire int) []byte {
+	return appendVarint(dst, uint64(field<<3|wire))
+}
+
+// appendString writes a length-delimited string field. Empty strings are
+// skipped (proto3 omits zero values, and an empty length-delimited field is
+// both wasteful and, for some servers, a parse distinction).
+func appendString(dst []byte, field int, s string) []byte {
+	if s == "" {
+		return dst
+	}
+	dst = appendTag(dst, field, wireBytes)
+	dst = appendVarint(dst, uint64(len(s)))
+	return append(dst, s...)
+}
+
+// appendBytes writes a length-delimited bytes field (empty allowed: a repeated
+// history entry may legitimately be an empty JSON blob placeholder).
+func appendBytes(dst []byte, field int, b []byte) []byte {
+	dst = appendTag(dst, field, wireBytes)
+	dst = appendVarint(dst, uint64(len(b)))
+	return append(dst, b...)
+}
+
+// appendMessage writes an embedded message field (length-delimited).
+func appendMessage(dst []byte, field int, msg []byte) []byte {
+	return appendBytes(dst, field, msg)
+}
+
+// appendBool writes a varint bool field, omitting false (proto3 zero value).
+func appendBool(dst []byte, field int, b bool) []byte {
+	if !b {
+		return dst
+	}
+	dst = appendTag(dst, field, wireVarint)
+	return append(dst, 1)
+}
+
+// appendInt32 writes a varint int32 field, omitting zero (proto3 zero value).
+func appendInt32(dst []byte, field int, v int32) []byte {
+	if v == 0 {
+		return dst
+	}
+	dst = appendTag(dst, field, wireVarint)
+	return appendVarint(dst, uint64(uint32(v)))
+}
+
+// appendUint32 encodes a uint32 field as a varint without narrowing the value
+// through int32 (correlation ids from the server are uint64; a truncating
+// cast would echo a wrong id and break the reply correlation).
+func appendUint32(dst []byte, field int, v uint32) []byte {
+	if v == 0 {
+		return dst
+	}
+	dst = appendTag(dst, field, wireVarint)
+	return appendVarint(dst, uint64(v))
+}
+
+// varintLen returns the wire size of v encoded as a varint.
+func varintLen(v uint64) int {
+	n := 1
+	for v >= 0x80 {
+		v >>= 7
+		n++
+	}
+	return n
+}
+
+// tagLen returns the wire size of a field key.
+func tagLen(field, wire int) int {
+	return varintLen(uint64(field<<3 | wire))
+}
+
+// bytesFieldLen returns the encoded size of a length-delimited field carrying
+// an n-byte payload, including the empty-payload encoding appendBytes emits.
+func bytesFieldLen(field, n int) int {
+	return tagLen(field, wireBytes) + varintLen(uint64(n)) + n
+}
+
+// uint32FieldLen returns the encoded size of a varint uint32 field, matching
+// appendUint32's omission of the proto3 zero value.
+func uint32FieldLen(field int, v uint32) int {
+	if v == 0 {
+		return 0
+	}
+	return tagLen(field, wireVarint) + varintLen(uint64(v))
+}
+
+// stringFieldLen returns the encoded size of a length-delimited string field,
+// matching appendString's omission of the empty string.
+func stringFieldLen(field int, s string) int {
+	if s == "" {
+		return 0
+	}
+	return bytesFieldLen(field, len(s))
+}
+
+// protoField is one decoded field: its number, wire type, and payload.
+// For wireBytes, raw holds the length-delimited bytes (string/bytes/message).
+// For wireVarint, num holds the decoded varint value.
+type protoField struct {
+	num  int
+	wire int
+	raw  []byte
+	n    uint64
+}
+
+// parseProtoFields decodes a protobuf message into its top-level fields.
+// Unknown fields are tolerated (returned) so callers can ignore them; only a
+// structurally malformed buffer (truncated varint, overrun length) errors.
+// The returned slices alias into msg - callers must not retain them past msg's
+// lifetime, which is fine for our single-pass decode. Each call is one frame
+// and starts a fresh field budget; recursive decoders use
+// parseProtoFieldsWire with the caller's budget instead.
+func parseProtoFields(msg []byte) ([]protoField, error) {
+	return parseProtoFieldsWire(msg, false, newProtoFieldBudget())
+}
+
+// parseProtoFieldsLenient is parseProtoFields but tolerates a fixed64 (wire 1)
+// field by reading 8 bytes into raw, so google.protobuf.Value number fields
+// decode. All other wire types behave as parseProtoFields (fail closed).
+func parseProtoFieldsLenient(msg []byte) ([]protoField, error) {
+	return parseProtoFieldsWire(msg, true, newProtoFieldBudget())
+}
+
+// parseProtoFieldsWire is the one wire-format parser, parameterized by the
+// accepted wire types. The strict set is varint (0) and length-delimited (2) -
+// the two the Cursor schema uses; fixedNumbers admits the fixed64/fixed32
+// encodings (wires 1 and 5) on top, for the google.protobuf.Value shim. Any
+// other wire type (group, or a fixed type in strict mode) means we're
+// misaligned or the schema grew a type we don't model: fail closed rather
+// than mis-parse. Every parsed field charges budget, including fields of
+// nested containers, so the frame-wide bound survives recursion.
+func parseProtoFieldsWire(msg []byte, fixedNumbers bool, budget *protoFieldBudget) ([]protoField, error) {
+	var fields []protoField
+	i := 0
+	for i < len(msg) {
+		if err := budget.consume(); err != nil {
+			return nil, err
+		}
+		key, n := consumeVarint(msg[i:])
+		if n <= 0 {
+			return nil, fmt.Errorf("protobuf: bad field key at offset %d", i)
+		}
+		i += n
+		num := int(key >> 3)
+		wire := int(key & 0x7)
+		f := protoField{num: num, wire: wire}
+		switch wire {
+		case wireVarint:
+			v, m := consumeVarint(msg[i:])
+			if m <= 0 {
+				return nil, fmt.Errorf("protobuf: bad varint field %d at offset %d", num, i)
+			}
+			i += m
+			f.n = v
+		case wireBytes:
+			l, m := consumeVarint(msg[i:])
+			if m <= 0 {
+				return nil, fmt.Errorf("protobuf: bad length field %d at offset %d", num, i)
+			}
+			i += m
+			if l > uint64(len(msg)-i) {
+				return nil, fmt.Errorf("protobuf: field %d length %d overruns buffer", num, l)
+			}
+			f.raw = msg[i : i+int(l)]
+			i += int(l)
+		case 1: // fixed64 (google.protobuf.Value number_value)
+			if !fixedNumbers {
+				return nil, fmt.Errorf("protobuf: unsupported wire type %d for field %d", wire, num)
+			}
+			if len(msg)-i < 8 {
+				return nil, fmt.Errorf("protobuf: truncated fixed64 field %d", num)
+			}
+			f.raw = msg[i : i+8]
+			i += 8
+		case 5: // fixed32
+			if !fixedNumbers {
+				return nil, fmt.Errorf("protobuf: unsupported wire type %d for field %d", wire, num)
+			}
+			if len(msg)-i < 4 {
+				return nil, fmt.Errorf("protobuf: truncated fixed32 field %d", num)
+			}
+			f.raw = msg[i : i+4]
+			i += 4
+		default:
+			return nil, fmt.Errorf("protobuf: unsupported wire type %d for field %d", wire, num)
+		}
+		fields = append(fields, f)
+	}
+	return fields, nil
+}
+
+// consumeVarint reads a base-128 varint from b, returning the value and the
+// number of bytes consumed (<=0 on malformed/truncated input).
+func consumeVarint(b []byte) (uint64, int) {
+	var v uint64
+	for i := 0; i < len(b) && i < 10; i++ {
+		c := b[i]
+		if c < 0x80 {
+			// The 10th byte may only carry 1 bit (values fit in 64 bits).
+			if i == 9 && c > 1 {
+				return 0, -1
+			}
+			return v | uint64(c)<<uint(7*i), i + 1
+		}
+		v |= uint64(c&0x7f) << uint(7*i)
+	}
+	return 0, -1
+}
+
+// firstField returns the first field with the given number, or nil.
+func firstField(fields []protoField, num int) *protoField {
+	for i := range fields {
+		if fields[i].num == num {
+			return &fields[i]
+		}
+	}
+	return nil
+}
+
+// subFields parses an embedded message field's bytes into its fields.
+func subFields(f *protoField, budgets ...*protoFieldBudget) ([]protoField, error) {
+	if f == nil || f.wire != wireBytes {
+		return nil, fmt.Errorf("protobuf: field is not an embedded message")
+	}
+	budget := newProtoFieldBudget()
+	if len(budgets) > 0 && budgets[0] != nil {
+		budget = budgets[0]
+	}
+	return parseProtoFieldsWire(f.raw, false, budget)
+}
+
+// decodeMapEntry splits one map<string, bytes> entry message: field 1
+// carries the key string, field 2 the value bytes. ok=false when the entry
+// is malformed or the key is empty, so each caller keeps its own skip or
+// fail policy. A non-nil error is a frame-level failure (the shared field
+// budget ran out) that callers must propagate instead of skipping.
+func decodeMapEntry(raw []byte, budget *protoFieldBudget) (key string, val []byte, ok bool, err error) {
+	fields, err := parseProtoFieldsWire(raw, false, budget)
+	if err != nil {
+		return "", nil, false, err
+	}
+	for _, f := range fields {
+		if f.num == 1 {
+			key = string(f.raw)
+		} else if f.num == 2 {
+			val = f.raw
+		}
+	}
+	return key, val, key != "", nil
+}
+
+// decodeStringValueMapEntry decodes a map<string, bytes> entry, then decodes
+// the value bytes as a google.protobuf.Value shim. Returns the key and the
+// decoded Go value. budget is the enclosing frame's field budget, shared by
+// the entry and every Value container below it.
+func decodeStringValueMapEntry(entry []byte, budget *protoFieldBudget) (string, any, bool) {
+	key, valBytes, ok, err := decodeMapEntry(entry, budget)
+	if err != nil || !ok {
+		return "", nil, false
+	}
+	v, valid := decodeProtoValue(valBytes, 0, budget)
+	return key, v, valid
+}
+
+// decodeProtoValue decodes the google.protobuf.Value shim:
+// oneof kind { null=1, number=2 (fixed64), string=3, bool=4, struct=5, list=6 }.
+// Falls back to the raw bytes as a UTF-8 string when it isn't a Value envelope
+// (some servers send plain text). Returns ok=false on a structurally malformed
+// buffer, an exhausted frame field budget, or Value nesting deeper than
+// protoValueMaxDepth (each container hop adds one level; the entry point
+// passes 0). The latter two are hard failures: an over-budget or over-deep
+// frame must never be admitted as a raw string argument.
+func decodeProtoValue(b []byte, depth int, budget *protoFieldBudget) (any, bool) {
+	if depth > protoValueMaxDepth {
+		return nil, false
+	}
+	if len(b) == 0 {
+		return nil, true
+	}
+	fields, err := parseProtoFieldsWire(b, true, budget)
+	if err != nil {
+		if errors.Is(err, errProtoFieldCount) {
+			return nil, false
+		}
+		// Not a Value envelope - treat as raw UTF-8 text (cursor2api does this).
+		return string(b), true
+	}
+	for _, f := range fields {
+		switch f.num {
+		case 3: // string_value
+			return string(f.raw), true
+		case 4: // bool_value
+			return f.n != 0, true
+		case 2: // number_value (fixed64) - our parser only does varint/bytes, so
+			// a fixed64 lands in raw as the 8 little-endian bytes. Best-effort.
+			if len(f.raw) == 8 {
+				bits := uint64(f.raw[0]) | uint64(f.raw[1])<<8 | uint64(f.raw[2])<<16 | uint64(f.raw[3])<<24 |
+					uint64(f.raw[4])<<32 | uint64(f.raw[5])<<40 | uint64(f.raw[6])<<48 | uint64(f.raw[7])<<56
+				return math.Float64frombits(bits), true
+			}
+			return f.raw, true
+		case 5: // struct_value: map<string, Value>
+			return decodeProtoStruct(f.raw, depth+1, budget)
+		case 6: // list_value: repeated Value
+			return decodeProtoList(f.raw, depth+1, budget)
+		case 1: // null_value
+			return nil, true
+		}
+	}
+	return string(b), true
+}
+
+// decodeProtoStruct decodes a Struct (map<string, Value> at field 1). depth is
+// the caller's nesting level, already incremented for this container. budget
+// is the enclosing frame's field budget; an exhausted budget fails the whole
+// decode instead of dropping the entry that hit it.
+func decodeProtoStruct(b []byte, depth int, budget *protoFieldBudget) (map[string]any, bool) {
+	fields, err := parseProtoFieldsWire(b, false, budget)
+	if err != nil {
+		return nil, false
+	}
+	out := map[string]any{}
+	for _, f := range fields {
+		if f.num != 1 {
+			continue
+		}
+		// each entry: map<string, Value> with field 1 = key, field 2 = Value
+		k, vb, ok, err := decodeMapEntry(f.raw, budget)
+		if err != nil {
+			if errors.Is(err, errProtoFieldCount) {
+				return nil, false
+			}
+			continue
+		}
+		if !ok {
+			continue
+		}
+		v, vok := decodeProtoValue(vb, depth, budget)
+		if !vok {
+			return nil, false
+		}
+		out[k] = v
+	}
+	return out, true
+}
+
+// decodeProtoList decodes a ListValue (repeated Value at field 1). depth is
+// the caller's nesting level, already incremented for this container. budget
+// is the enclosing frame's field budget.
+func decodeProtoList(b []byte, depth int, budget *protoFieldBudget) ([]any, bool) {
+	fields, err := parseProtoFieldsWire(b, false, budget)
+	if err != nil {
+		return nil, false
+	}
+	var out []any
+	for _, f := range fields {
+		if f.num != 1 {
+			continue
+		}
+		v, ok := decodeProtoValue(f.raw, depth, budget)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, v)
+	}
+	return out, true
+}

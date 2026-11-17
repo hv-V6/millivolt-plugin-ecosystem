@@ -1,0 +1,36 @@
+# The tag tracks go.mod; a source check rejects toolchain drift.
+FROM --platform=$BUILDPLATFORM golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS build
+WORKDIR /src
+ENV GOTOOLCHAIN=local
+COPY go.mod go.sum ./
+RUN go mod download
+COPY VERSION version.go LICENSE THIRD_PARTY_NOTICES.md ./
+COPY cmd/proxy ./cmd/proxy
+COPY internal ./internal
+COPY scripts/licenses ./scripts/licenses
+ARG TARGETOS
+ARG TARGETARCH
+ARG REVISION
+# The collector runs on BUILDPLATFORM and queries the target graph itself.
+RUN mkdir -p /out/data /out/config && \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -mod=readonly -trimpath -buildvcs=false \
+      -ldflags="-s -X $(go list -m).revisionOverride=$REVISION" -o /out/millivolt ./cmd/proxy && \
+    go run -mod=readonly ./scripts/licenses -target "$TARGETOS/$TARGETARCH" -out /out/licenses
+
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:516757106de35205efb70b91ba03f6f1298424a0678c603255cf2852a7000087
+COPY --from=build /out/millivolt /millivolt
+COPY --from=build /out/licenses /usr/share/licenses/millivolt
+COPY --from=build --chown=65532:65532 /out/data/ /data/
+COPY --from=build --chown=65532:65532 /out/config/ /config/
+# Docker seeds a fresh config volume from this generated example. Existing
+# volume contents are retained; Settings owns subsequent private edits.
+COPY --chown=65532:65532 --chmod=0600 proxy.example.yaml /config/proxy.yaml
+USER 65532:65532
+WORKDIR /data
+EXPOSE 8080
+STOPSIGNAL SIGTERM
+# Distroless has no shell or curl: the binary probes its own /healthz, which
+# is deliberately unauthenticated so the healthcheck carries no credential.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["/millivolt", "-config", "/config/proxy.yaml", "-db-path", "/data/proxy.db", "-healthcheck"]
+ENTRYPOINT ["/millivolt"]
+CMD ["-config", "/config/proxy.yaml", "-db-path", "/data/proxy.db"]

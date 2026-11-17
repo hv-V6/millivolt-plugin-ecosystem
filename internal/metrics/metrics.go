@@ -1,0 +1,686 @@
+package metrics
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+	"time"
+)
+
+// Usage is the normalized token/cache accounting for a single request. Fields
+// are populated from the provider's usage payload (OpenAI `usage` object or
+// Anthropic `message_start`/`message_delta`) and fall back to a running
+// content-chunk count when the stream is interrupted before the usage chunk
+// arrives.
+type Usage struct {
+	InputTokens     int64 `json:"input_tokens"`
+	OutputTokens    int64 `json:"output_tokens"`
+	TotalTokens     int64 `json:"total_tokens"`
+	CacheReadTokens int64 `json:"cache_read_tokens"`
+	CacheWrite      int64 `json:"cache_write_tokens"`
+	ReasoningTokens int64 `json:"reasoning_tokens"`
+}
+
+// RetryAttempt is one transparently-absorbed upstream response - a 429 or 5xx
+// the proxy retried before returning a final answer to the client. It carries
+// the status and the provider's error detail so the proxy's audit log shows
+// every failure even though the client only ever saw the successful outcome.
+//
+// The upstream-response metadata fields mirror the record's final-response
+// capture exactly (same names, same meaning, same JSON tags): every attempt,
+// absorbed or final, stores the same information, so a provider-side request
+// id can be matched to the exact upstream attempt that produced it.
+// Transport failures have no HTTP response and leave them empty/zero.
+// tests/_go/internal/metrics/attempt_metadata.go pins the field-set parity.
+type RetryAttempt struct {
+	StatusCode   int       `json:"status_code"`
+	ErrorType    string    `json:"error_type,omitempty"`
+	ErrorCode    string    `json:"error_code,omitempty"`
+	ErrorMsg     string    `json:"error_msg,omitempty"`
+	RetryAfterMs int       `json:"retry_after_ms,omitempty"`
+	At           time.Time `json:"at"`
+
+	// Upstream-response metadata, the attempt-log twin of the record's
+	// ProviderRequestID/ProviderServer/ProviderModel/ProcessingMs/
+	// RateLimitRemaining/RateLimitLimit/ResponseHeaders fields
+	// (captureUpstreamHeaders owns the capture semantics).
+	ProviderRequestID  string              `json:"provider_request_id,omitempty"`
+	ProviderServer     string              `json:"provider_server,omitempty"`
+	ProviderModel      string              `json:"provider_model,omitempty"`
+	ProcessingMs       int                 `json:"processing_ms"`
+	RateLimitRemaining int                 `json:"rate_limit_remaining,omitempty"`
+	RateLimitLimit     int                 `json:"rate_limit_limit,omitempty"`
+	ResponseHeaders    map[string][]string `json:"response_headers,omitempty"`
+}
+
+// Record is the per-request observability record. Every field is captured at
+// the proxy boundary and carries no request/response payload.
+type Record struct {
+	ID        string `json:"id"`
+	Provider  string `json:"provider"`
+	Model     string `json:"model"`
+	KeyHash   string `json:"key_hash"` // sha256 of the upstream key, never the key itself
+	UserAgent string `json:"user_agent"`
+	Client    string `json:"client"` // friendly app/SDK classification (e.g. "desktop-client", "openai-python")
+	Stream    bool   `json:"stream"`
+
+	// ConversationID groups requests that belong to the same conversation/task.
+	// Set from X-Proxy-Session when the client provides one, else auto-derived
+	// by the proxy from turn-count monotonicity (see conversation.go).
+	ConversationID string `json:"conversation_id,omitempty"`
+	// ParentConversationID is the client's explicit direct-parent declaration.
+	// Relationships are resolved within Client+KeyHash, never by this ID alone.
+	// Empty means no declaration; response continuity does not imply parentage.
+	ParentConversationID string `json:"parent_conversation_id,omitempty"`
+
+	// Client identification & connection metadata, captured automatically.
+	ClientIP   string `json:"client_ip"`             // remote address (host part only)
+	Path       string `json:"path"`                  // request path (e.g. /v1/chat/completions)
+	Method     string `json:"method"`                // HTTP method
+	ClientLang string `json:"client_lang,omitempty"` // x-stainless-lang / parsed from UA
+
+	// ClientMeta is extra identity and routing config the client sent
+	// (X-Stainless-* SDK headers, X-Proxy-Format / timeout / per-request
+	// max-concurrency). Never keys, never message content. Empty is omitted.
+	ClientMeta ClientMeta `json:"client_meta,omitempty"`
+
+	// Provider-side metadata captured from the response (headers + body).
+	ProviderRequestID string `json:"provider_request_id,omitempty"` // x-request-id / anthropic-request-id
+	ProviderServer    string `json:"provider_server,omitempty"`     // Server header
+	ProviderModel     string `json:"provider_model,omitempty"`      // model echoed by the provider (may differ from requested)
+	ProcessingMs      int    `json:"processing_ms"`                 // provider-reported server processing time (x-openai-processing-ms / anthropic-...)
+	RetryAfterMs      int    `json:"retry_after_ms,omitempty"`      // Retry-After hint on 429
+
+	StatusCode int       `json:"status_code"`
+	Start      time.Time `json:"start"`
+	End        time.Time `json:"end"`
+
+	// FirstTokenAt / LastTokenAt are the wall-clock times of the first and last
+	// content-bearing token, used to derive TTFT and decode TPS.
+	FirstTokenAt time.Time `json:"first_token_at,omitempty"`
+	LastTokenAt  time.Time `json:"last_token_at,omitempty"`
+
+	// FinalAttemptAt is when the upstream attempt that produced the returned
+	// response began. On a request with transparent retries, TTFT is measured
+	// from this point (the successful attempt) rather than from Start, so the
+	// dashboard shows the provider's real responsiveness, not the retry
+	// backlog. Zero when there were no retries (TTFT falls back to Start).
+	FinalAttemptAt time.Time `json:"final_attempt_at,omitempty"`
+
+	FinishReason       string   `json:"finish_reason,omitempty"`
+	ErrorType          string   `json:"error_type,omitempty"`
+	ErrorMsg           string   `json:"error_msg,omitempty"`
+	ErrorCode          string   `json:"error_code,omitempty"`
+	ToolCalls          int      `json:"tool_calls"`
+	ToolNames          []string `json:"tool_names,omitempty"`
+	Usage              Usage    `json:"usage"`
+	ClientDisconnected bool     `json:"client_disconnected"`
+
+	// Rate-limit headers captured from upstream responses.
+	RateLimitRemaining int `json:"rate_limit_remaining,omitempty"`
+	RateLimitLimit     int `json:"rate_limit_limit,omitempty"`
+
+	// Paused is a live-only flag: the request is queued because of the
+	// operator hold. Never persisted (the store insert list omits it).
+	Paused bool `json:"paused,omitempty"`
+
+	// Throttled is a live-only flag: the request is queued on a provider
+	// concurrency / requests-per-window / tokens-per-window cap. Never persisted.
+	Throttled bool `json:"throttled,omitempty"`
+
+	// Debug is set when an operator debug session matched this request.
+	// The full capture (bodies, headers) lives in the request_debug sidecar,
+	// never on this record - the ring/SSE carry only this flag + session id.
+	Debug          bool   `json:"debug,omitempty"`
+	DebugSessionID string `json:"debug_session_id,omitempty"`
+
+	// Queueing/scheduler metadata.
+	QueueWaitMs int64 `json:"queue_wait_ms"`          // time spent in the scheduler queue before sending
+	Retries     int   `json:"retries"`                // number of transparent upstream retries (429/5xx)
+	RateLimited bool  `json:"rate_limited,omitempty"` // scheduler wait or 429/503 pacing; HasRateLimit owns the exact 429 predicate
+	// Attempts records each transparently-retried upstream response (the ones
+	// the client never saw) so the proxy logs the full history, not just the
+	// final outcome. Bounded by max_retries.
+	Attempts []RetryAttempt `json:"attempts,omitempty"`
+
+	// Derived fields populated at record time for the dashboard/storage.
+	TTFTMs     int64   `json:"ttft_ms"`
+	OverallTPS float64 `json:"overall_tps"`
+	DecodeTPS  float64 `json:"gen_tps"`
+	DurationMs int64   `json:"duration_ms"`
+	Cost       float64 `json:"cost,omitempty"`
+
+	// Reasoning ("thinking") tokens captured separately. For reasoning models
+	// (o-series, DeepSeek R1, Claude extended thinking), reasoning tokens are
+	// invisible thinking; answer tokens are the visible response. We also track
+	// the time when the first answer (non-reasoning) token arrives separately.
+	AnswerTokens  int64     `json:"answer_tokens"` // completion_tokens - reasoning_tokens
+	FirstAnswerAt time.Time `json:"first_answer_at,omitempty"`
+	// FirstReasoningAt is the absolute unix-millisecond time of the first
+	// reasoning-BEARING chunk of the analyzed stream - for example a
+	// reasoning content delta, a Responses reasoning or reasoning-summary
+	// text delta, a Gemini thought marker, or a thinking-block start; not
+	// literally a token. The generic relay's SSE analyzer owns it; the
+	// cursor bridge synthesizes frames itself and never stamps it, so
+	// streamed cursor rows keep 0. It is also 0 when the stream carried
+	// no reasoning block (or the request was not streamed).
+	FirstReasoningAt int64 `json:"first_reasoning_at,omitempty"`
+
+	// HadAnswerContent records whether the response carried answer text content
+	// (role:"assistant" content parts), independent of timing - set for BOTH
+	// streaming (a content chunk arrived) and non-streaming (the JSON message
+	// had non-empty content) paths. FinalizeRecord uses it to tell a
+	// tool-call-ONLY response (no content → completion_tokens are all tool-call
+	// arguments, not generation) from a mixed content+tool_calls response.
+	HadAnswerContent bool `json:"had_answer_content,omitempty"`
+
+	// GenTokens is the count of GENERATION tokens (reasoning + answer content)
+	// with tool-call argument tokens excluded. It is the numerator for DecodeTPS
+	// (gen_tps): providers count tool-call argument tokens in completion_tokens
+	// (OpenAI does - a content:null tool_calls response still bills them), which
+	// would otherwise inflate the generation rate. When the provider reports a
+	// usage blob, GenTokens = reasoning + answer (== OutputTokens, since the
+	// proxy has no tool-token sub-breakdown and tool args are only separable in
+	// the chunk-count fallback); when it doesn't, GenTokens = content+reasoning
+	// chunks (tool-arg chunks excluded). See Fill / FinalizeRecord.
+	GenTokens int64 `json:"gen_tokens,omitempty"`
+
+	// Chunks is the count of content-bearing SSE chunks of the analyzed
+	// stream (content, reasoning and tool-call deltas; role/keepalive/
+	// terminal/usage frames are not content-bearing). The generic relay's
+	// SSE analyzer owns it; the cursor bridge synthesizes frames itself and
+	// never populates it, so streamed cursor rows keep 0 - as do
+	// non-streamed requests. It is the raw stream telemetry behind the
+	// no-usage token fallbacks in Fill.
+	Chunks int64 `json:"chunks,omitempty"`
+
+	// RequestBytes is the size of the client's inbound request body,
+	// captured once by readRequest on the bytes it already read - before
+	// the request-overrides rewrite and any format translation can replace
+	// them, so it always describes the client's upload.
+	RequestBytes int64 `json:"request_bytes,omitempty"`
+
+	// ResponseBytes is the number of delivered response body bytes: the
+	// body bytes the relay handed to the client socket for the returned
+	// response, relayed upstream error bodies included. It accumulates at
+	// the relay write sites (streamBody's write_out/hold releases,
+	// nonStreamBody, commitSpooledBody, the translated body write,
+	// streamBodyTranslated, the raw-copy fallbacks through
+	// disconnectWriter, and the cursor bridge's counting writer) and NEVER
+	// resets across an in-request attempt change, because only bytes the
+	// client writer accepted are counted: on the non-streaming quality
+	// surface the abandoned attempts wrote nothing (their bodies are
+	// spooled before any write), so the accumulated total is the adopted
+	// attempt's body alone; on the streaming rescue surface the abandoned
+	// attempt's role/keepalive/reasoning frames genuinely reached the client
+	// and the fresh attempt appends behind them, so the accumulated total
+	// IS the bytes the client received. Proxy-synthesized signaling is NOT
+	// body relay and is NOT counted, in every rendering: the status-line
+	// error envelopes (http.Error 502s, queue-full and storm 429s) and the
+	// in-band SSE rejection pairs (error frame + [DONE] emitted in place of
+	// a response), plus the SSE pacer's keepalives. The one counted
+	// proxy-synthesized pair is the degenerate terminal-region substitution
+	// (emitDegenerateSSE): it replaces withheld content the client would
+	// otherwise have received, so it is delivered body, not signaling. The
+	// cursor surface is the deliberate exception: the bridge synthesizes the
+	// whole response itself, so its counting writer counts every body byte
+	// it emits, error bodies included.
+	ResponseBytes int64 `json:"response_bytes,omitempty"`
+
+	// UpstreamGzip records that the upstream response arrived gzip-compressed
+	// and Go's transport transparently decompressed it (buildUpstreamRequest
+	// drops Accept-Encoding so the transport adds its own gzip preference).
+	// It is captured at response admission by captureUpstreamHeaders, the
+	// single owner of response metadata: the transport deletes
+	// Content-Encoding and Content-Length from the header map on
+	// auto-decompress, so the captured response headers cannot show the
+	// wire compression - this flag is the only retained fact about it.
+	// No omitempty, like stream and client_disconnected: a stored false
+	// travels to the wire so the dashboard renders an explicit false row.
+	UpstreamGzip bool `json:"upstream_gzip"`
+
+	// UpstreamConnectMs / UpstreamTLSMs / UpstreamTTFBMs decompose the
+	// transport time of the FINAL adopted upstream attempt via
+	// net/http/httptrace, and UpstreamConnReused carries that attempt's
+	// pool-hit fact (0 = fresh dial). Like TTFT - which is measured from the
+	// successful attempt when retries happened - they describe the attempt
+	// whose response the relay adopted, never the absorbed failures before
+	// it: a failed attempt's trace dies with its context, so a request whose
+	// retries all failed keeps these fields at 0. upstream_ttfb_ms measures
+	// from the adopted attempt's own send start (the same anchor as
+	// final_attempt_at) to the first byte of response headers, so it is the
+	// only upstream timing a response that never streams a token carries
+	// (ttft_ms stays 0 there), while connect, tls and reused stamp the same
+	// attempt's transport facts on streamed and non-streamed requests alike;
+	// connect is the attempt's dial phase (0 when the connection was reused,
+	// no dial happened); tls is its handshake (0 when reused or plaintext).
+	// All are integer milliseconds where 0 means "not observed": a hook that
+	// never fired leaves 0, and a partially observed attempt (for example a
+	// dial that never completed) legitimately carries only the parts that
+	// did - partial states are observations, never errors.
+	UpstreamConnectMs int64 `json:"upstream_connect_ms,omitempty"`
+	UpstreamTLSMs     int64 `json:"upstream_tls_ms,omitempty"`
+	UpstreamTTFBMs    int64 `json:"upstream_ttfb_ms,omitempty"`
+	// UpstreamConnReused has no omitempty for the same reason as
+	// UpstreamGzip: a stored false is a real observation (a fresh dial) and
+	// must reach the wire like every other record flag.
+	UpstreamConnReused bool `json:"upstream_conn_reused"`
+
+	// LLM request parameters parsed from the request body. These are the fields
+	// that define the request shape; they carry no message content.
+	ReqMaxTokens    *int     `json:"req_max_tokens,omitempty"`
+	ReqTemperature  *float64 `json:"req_temperature,omitempty"`
+	ReqTopP         *float64 `json:"req_top_p,omitempty"`
+	ReqToolsCount   int      `json:"req_tools_count"`
+	ReqToolChoice   string   `json:"req_tool_choice,omitempty"`
+	ReqStreamOpts   bool     `json:"req_stream_opts,omitempty"`
+	ReqN            *int     `json:"req_n,omitempty"`
+	ReqStop         int      `json:"req_stop,omitempty"`     // number of stop sequences
+	ReqLogprobs     bool     `json:"req_logprobs,omitempty"` // whether logprobs requested
+	ReqPresencePen  *float64 `json:"req_presence_pen,omitempty"`
+	ReqFrequencyPen *float64 `json:"req_frequency_pen,omitempty"`
+
+	// Additional non-content request parameters, captured so the dashboard can
+	// show the full request shape without storing any message content.
+	ReqResponseFormat string `json:"req_response_format,omitempty"` // text / json_object / json_schema
+	ReqSeed           *int64 `json:"req_seed,omitempty"`
+	ReqParallelTools  *bool  `json:"req_parallel_tools,omitempty"`
+	ReqLogitBias      int    `json:"req_logit_bias,omitempty"`    // number of biased token ids
+	ReqTopLogprobs    *int   `json:"req_top_logprobs,omitempty"`  // top-logprobs count requested
+	ReqServiceTier    string `json:"req_service_tier,omitempty"`  // auto / flex / priority ...
+	ReqThinking       bool   `json:"req_thinking,omitempty"`      // anthropic extended-thinking requested
+	ReqMetadataKeys   int    `json:"req_metadata_keys,omitempty"` // number of metadata entries
+	// ReqReasoningEffort / ReqVerbosity are OpenAI request-config tokens
+	// (reasoning_effort, or reasoning.effort; verbosity). Shape only.
+	ReqReasoningEffort string `json:"req_reasoning_effort,omitempty"`
+	ReqVerbosity       string `json:"req_verbosity,omitempty"`
+
+	// Optional content previews. Populated only when capture_body_preview is
+	// enabled; off by default to avoid storing prompts in metrics storage.
+	// Both are capped at PreviewMaxBytes via TruncatePreview.
+	PromptPreview   string `json:"prompt_preview,omitempty"`
+	ResponsePreview string `json:"response_preview,omitempty"`
+
+	// Turn breakdown parsed from the request body (0 for non-chat endpoints).
+	TurnsUser      int `json:"turns_user"`
+	TurnsAssistant int `json:"turns_assistant"`
+	TurnsTool      int `json:"turns_tool"`
+
+	// Prompt composition parsed from the request body. Chars* are per-role
+	// text character counts (system = role:"system"/"developer" messages plus
+	// Anthropic's top-level "system" field) - sizes only, never content.
+	// Images/Attachments count multimodal content parts across all messages
+	// (an attachment is any non-image, non-text part: file/document/audio/
+	// video/embedded tool result). LastTurnRole is the role of the final
+	// message - what the model is actually responding to.
+	CharsSystem    int    `json:"chars_system"`
+	CharsUser      int    `json:"chars_user"`
+	CharsAssistant int    `json:"chars_assistant"`
+	CharsTool      int    `json:"chars_tool"`
+	Images         int    `json:"images"`
+	Attachments    int    `json:"attachments"`
+	LastTurnRole   string `json:"last_turn_role,omitempty"`
+
+	// Upstream response headers captured at the proxy (empty for errors pre-headers).
+	ResponseHeaders map[string][]string `json:"response_headers,omitempty"`
+}
+
+// ClientMeta is allowlisted client identity and proxy-routing config captured
+// at the request boundary. All fields are optional; Empty reports a zero value.
+type ClientMeta struct {
+	OS         string `json:"os,omitempty"`
+	Arch       string `json:"arch,omitempty"`
+	Runtime    string `json:"runtime,omitempty"`
+	RuntimeVer string `json:"runtime_ver,omitempty"`
+	PkgVer     string `json:"pkg_ver,omitempty"`
+	Format     string `json:"format,omitempty"`          // X-Proxy-Format
+	TimeoutMs  int    `json:"timeout_ms,omitempty"`      // X-Proxy-Timeout-Ms
+	MaxConc    int    `json:"max_concurrency,omitempty"` // X-Proxy-Max-Concurrency (per-request)
+}
+
+// Empty reports whether m carries any captured fact.
+func (m ClientMeta) Empty() bool { return m == (ClientMeta{}) }
+
+// OverallThroughput returns tokens per second computed from the full request
+// lifetime (start → end). This is the stable, always-correct metric.
+func (r *Record) OverallThroughput() float64 {
+	d := r.End.Sub(r.Start)
+	if d <= 0 || r.Usage.OutputTokens == 0 {
+		return 0
+	}
+	return float64(r.Usage.OutputTokens) / d.Seconds()
+}
+
+// GenThroughput returns generation tokens per second over the generation
+// window - from the FIRST token (reasoning or answer, whichever arrives first)
+// to the LAST token. The numerator is GenTokens (reasoning + answer content,
+// tool-call argument tokens excluded), so a tool-call-heavy request doesn't
+// show an inflated rate. The window ends at the last token, not at End (which
+// includes trailing usage/[DONE] handling), so it measures actual generation.
+// Returns 0 when there were no generation tokens or the window is degenerate.
+func (r *Record) GenThroughput() float64 {
+	if r.FirstTokenAt.IsZero() || r.GenTokens == 0 {
+		return 0
+	}
+	end := r.LastTokenAt
+	if end.IsZero() || !end.After(r.FirstTokenAt) {
+		// Single-token (or unmeasured last-token) responses have no measurable
+		// generation window; fall back to the request end so the rate is still
+		// meaningful rather than 0.
+		end = r.End
+	}
+	d := end.Sub(r.FirstTokenAt)
+	if d <= 0 {
+		return 0
+	}
+	return float64(r.GenTokens) / d.Seconds()
+}
+
+// IsError is the single canonical definition of "this request saw an upstream
+// failure". A request counts when the upstream produced a genuine failure -
+// a 5xx response or a structured error - at ANY point: as the final outcome
+// OR as an absorbed retry attempt (the upstream still failed, even if a later
+// retry recovered). A 429 is flow control, not an error, and never counts -
+// neither as the final status nor as an absorbed attempt. The same holds for
+// a 499 WITHOUT a structured error: the LOCAL client closed the connection
+// (its own cancellation - a relay write failed on broken pipe), recorded as
+// ClientDisconnected. A 499 WITH a structured error is different: the error
+// was observed on the wire before or while the client left (a provider
+// in-band stream error, or a translation failure), so the upstream failure
+// must not vanish from the error rate - it counts exactly like its 200 twin
+// (the committed status line a client abort cannot rewrite). (503 is retried
+// as a rate limit but is still a server error, so it counts.)
+//
+// StatusClientClosedRequest is the status recorded when the LOCAL client
+// disconnected before the proxy delivered a final response (nginx's "client
+// closed request" convention). It is a flow event like 429 - IsError treats a
+// plain one as a non-error (unless an absorbed 5xx attempt was seen), so a
+// user's own cancellation never inflates the error rate. One exception: a 499
+// that carries a structured error type observed the upstream's own failure
+// statement (most commonly a provider error event streamed in-band on the
+// committed 200, which the client then aborted around); that failure counts
+// as an error like its 200 twin.
+const StatusClientClosedRequest = 499
+
+// absorbedServerFailure is the one owner of the absorbed-5xx meaning: whether
+// any transparently-retried attempt saw a genuine upstream server failure.
+// A recovered retry still counts (the upstream did fail, even if a later
+// attempt succeeded); a 429 attempt is flow control and never does. IsError
+// relies on it in both of its arms, so the health counts cannot disagree
+// with themselves.
+func absorbedServerFailure(attempts []RetryAttempt) bool {
+	for _, a := range attempts {
+		if a.StatusCode >= 500 {
+			return true
+		}
+	}
+	return false
+}
+
+// Use it everywhere instead of re-deriving the predicate so the live counter,
+// the aggregates, and the dashboard never disagree. The purge SQL predicate
+// (storage.store.go's HasError clause) must stay semantically identical to
+// this function.
+func (r *Record) IsError() bool {
+	// A final 429 (rate limit) or 499 (local client closed the connection
+	// before a final outcome) is flow control/own-abort, not an error - even
+	// though the provider's error body may classify the 429 (ErrorType =
+	// rate_limit_error/provider_error). Rate limiting is surfaced separately
+	// through HasRateLimit; client disconnects via ClientDisconnected.
+	if r.StatusCode == 429 || r.StatusCode == StatusClientClosedRequest {
+		// A 499 carrying a structured error observed the upstream's failure
+		// before the client left (an in-band stream error on the committed
+		// 200, or a translation failure): the client aborted around a real
+		// provider failure, which counts exactly like the 200 twin. A plain
+		// 429 keeps its flow-control meaning even when its body classifies
+		// it.
+		if r.StatusCode == StatusClientClosedRequest && r.ErrorType != "" {
+			return true
+		}
+		// Still honor an absorbed 5xx from an earlier attempt (a request that
+		// saw a genuine server failure before the client gave up on it).
+		return absorbedServerFailure(r.Attempts)
+	}
+	// A structured error classified by the proxy (queue_full,
+	// upstream_unreachable, stream_read_error, transform_error, or the
+	// provider's parsed error type) is always a genuine failure.
+	if r.ErrorType != "" {
+		return true
+	}
+	// Final HTTP status: any error status (429/499 already excluded above).
+	if r.StatusCode >= 400 {
+		return true
+	}
+	// Absorbed retry attempts: a 5xx that a later retry masked still counts as
+	// an upstream failure (a 429 attempt is flow control and does not).
+	return absorbedServerFailure(r.Attempts)
+}
+
+// HasRateLimit reports whether this request received HTTP 429, either as its
+// final response or a retried attempt. It counts an affected request once,
+// not its attempts. RateLimited is broader scheduler metadata (queue waits
+// and 503 pacing) and intentionally does not define this observer metric.
+func (r *Record) HasRateLimit() bool {
+	if r.StatusCode == 429 {
+		return true
+	}
+	for _, attempt := range r.Attempts {
+		if attempt.StatusCode == 429 {
+			return true
+		}
+	}
+	return false
+}
+
+// PreviewMaxBytes bounds stored content previews (prompt/response). Content
+// previews exist only when capture_body_preview is enabled.
+const PreviewMaxBytes = 120
+
+// TruncatePreview is the single canonical preview truncation: it caps s at
+// PreviewMaxBytes, backing off to a rune boundary so the ellipsis never
+// follows a split multi-byte UTF-8 sequence.
+func TruncatePreview(s string) string {
+	if len(s) <= PreviewMaxBytes {
+		return s
+	}
+	return truncateUTF8(s, PreviewMaxBytes)
+}
+
+// HasErrorKey reports whether b contains a top-level-candidate "error" key,
+// tolerating optional whitespace before the colon (`"error":` and `"error" :`).
+// It is a cheap byte-scan GATE used to decide whether to run the full
+// ParseErrorEnvelope decode - not a parse itself. Both the SSE streaming
+// analyzer and the non-streaming body path share this single gate so the two
+// in-band-error detectors can never drift apart. The authoritative decode
+// (which only reads the top-level key, so a nested or string-literal "error"
+// never false-positives) happens in ParseErrorEnvelope.
+func HasErrorKey(b []byte) bool {
+	// Keep normal error-free chunks on the vectorized negative path. A key
+	// spelling of ASCII "error" can only hide a letter through a Unicode escape.
+	if !bytes.Contains(b, []byte(`"error"`)) && !bytes.Contains(b, []byte(`\u`)) {
+		return false
+	}
+	return JSONKey(b, "error") != nil
+}
+
+// ParseErrorEnvelope parses a provider error payload's top-level "error" key
+// into (type, code, message), provider-agnostic across the common wire shapes:
+//
+//	{"error":{"message":"...","type":"...","code":"..."}}     OpenAI / gateways
+//	{"type":"error","error":{"type":"overloaded_error",...}}   Anthropic
+//	{"error":"message"}                                        plain-string
+//
+// The code may be a string (OpenAI) or a bare number (OpenRouter/LiteLLM);
+// both are accepted. It returns ("", "", "") when the payload is decodable but
+// carries a null/empty error value (a decoy key, not a failure) - that lets
+// callers treat null envelopes as success while still catching real ones. For
+// genuinely unparseable JSON it also returns ("", "", ""); callers that must
+// still classify such bodies keep their own bounded raw-prefix fallback
+// (proxy's parseErrorBody). Message is bounded via TruncatePreview.
+func ParseErrorEnvelope(b []byte) (typ, code, msg string) {
+	trimmed := bytes.TrimSpace(b)
+	if len(trimmed) == 0 {
+		return "", "", ""
+	}
+	var probe struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(trimmed, &probe); err != nil {
+		return "", "", ""
+	}
+	return parseErrorValue(probe.Error)
+}
+
+// ParseResponseFailedEnvelope parses the provider error carried by a Responses
+// API response.failed event. That event nests its failure at
+// response.error ({"type":"response.failed","response":{...,"error":{...}}}),
+// so the top-level ParseErrorEnvelope sees only a decoy. The nested object is
+// decoded through the same parseErrorValue rules, and a top-level error wins
+// when a gateway also mirrors it there.
+func ParseResponseFailedEnvelope(b []byte) (typ, code, msg string) {
+	trimmed := bytes.TrimSpace(b)
+	if len(trimmed) == 0 {
+		return "", "", ""
+	}
+	var probe struct {
+		Error    json.RawMessage `json:"error"`
+		Response struct {
+			Error json.RawMessage `json:"error"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(trimmed, &probe); err != nil {
+		return "", "", ""
+	}
+	if typ, code, msg = parseErrorValue(probe.Error); typ != "" {
+		return typ, code, msg
+	}
+	return parseErrorValue(probe.Response.Error)
+}
+
+// parseErrorValue applies the canonical envelope rules to an already-captured
+// top-level "error" value. ParseErrorEnvelope and the one-pass non-stream
+// analysis share it so both surfaces read the same decoys, string/numeric
+// codes, fallback type and bounded message.
+func parseErrorValue(raw json.RawMessage) (typ, code, msg string) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", "", ""
+	}
+	switch raw[0] {
+	case '"':
+		_ = json.Unmarshal(raw, &msg)
+	case '{':
+		var e struct {
+			Type    string          `json:"type"`
+			Code    json.RawMessage `json:"code"`
+			Message string          `json:"message"`
+		}
+		if err := json.Unmarshal(raw, &e); err != nil {
+			return "", "", ""
+		}
+		typ, msg = e.Type, e.Message
+		if c := bytes.TrimSpace(e.Code); len(c) > 0 && !bytes.Equal(c, []byte("null")) {
+			if c[0] == '"' {
+				_ = json.Unmarshal(c, &code)
+			} else {
+				code = string(c) // numeric code, kept verbatim
+			}
+		}
+	default:
+		// A number/bool/array under "error" is not a failure we can classify.
+		return "", "", ""
+	}
+	if typ == "" && code == "" && msg == "" {
+		return "", "", "" // empty object/string: a decoy, not a failure
+	}
+	if typ == "" {
+		typ = "provider_error"
+	}
+	return typ, code, TruncatePreview(msg)
+}
+
+// nonRetryableQuotaClasses are provider error type/code strings that, when
+// delivered with HTTP 429, denote a DURABLE account/billing condition - quota
+// or credits exhausted, spend/hard limits, expired plans. The ordinary retry
+// ladder never absorbs one: only quota_pause_mode governs their reaction (off
+// surfaces them immediately; retry parks the provider behind a recovery
+// gate whose re-sends are probe-paced, never budget-burned; manual installs
+// an operator hold), the error-storm observation excludes them from storm
+// evidence in every mode, and the retryable-in-band-error precedence denies
+// them ahead of every operator extension. Transient rate-limit 429s keep
+// their normal retry/backoff behavior. Exact match (after lowercasing)
+// against the canonical envelope parser's type AND code fields, never
+// message text: OpenAI insufficient_quota / *_limit_reached family, Kimi
+// exceeded_current_quota_error, and Z.AI's numeric business codes (1113
+// balance exhausted, 1309/1311/1314/1315 plan/package limits). The single
+// owner: the proxy's 429 absorb path, storm observation and the in-band
+// error precedence, and config's retryable_error_classes validation all
+// consult this one vocabulary.
+var nonRetryableQuotaClasses = map[string]bool{
+	"insufficient_quota":                true,
+	"insufficient_credits":              true,
+	"credit_balance_exhausted":          true,
+	"organization_spend_limit_exceeded": true,
+	"project_spend_limit_exceeded":      true,
+	"organization_usage_limit_exceeded": true,
+	"billing_hard_limit_reached":        true,
+	"billing_not_active":                true,
+	"exceeded_current_quota_error":      true,
+	"1113":                              true,
+	"1309":                              true,
+	"1311":                              true,
+	"1314":                              true,
+	"1315":                              true,
+}
+
+// NonRetryableQuotaClass returns the fixed vocabulary token for a structured
+// error's durable quota/billing condition: the matched type first, else the
+// matched code, lowercased - "" when neither matches. The returned token is
+// a vocabulary entry by construction, so it is the safe protocol label for
+// gate reasons and hold labels: never provider-controlled envelope text.
+func NonRetryableQuotaClass(typ, code string) string {
+	typ, code = strings.ToLower(typ), strings.ToLower(code)
+	if nonRetryableQuotaClasses[typ] {
+		return typ
+	}
+	if nonRetryableQuotaClasses[code] {
+		return code
+	}
+	return ""
+}
+
+// IsNonRetryableQuotaErr reports whether a structured error's type or code is
+// a durable account/billing condition that a retry can never clear.
+func IsNonRetryableQuotaErr(typ, code string) bool {
+	return NonRetryableQuotaClass(typ, code) != ""
+}
+
+// TTFT returns the time to first token, or 0 if the response produced no
+// tokens (e.g. a pure error or empty completion). It is measured from the
+// final (returned) upstream attempt's start when retries occurred - so a
+// request that absorbed retries shows the successful attempt's real TTFT, not
+// the accumulated retry delay. Duration still reflects total wall time.
+func (r *Record) TTFT() time.Duration {
+	if r.FirstTokenAt.IsZero() {
+		return 0
+	}
+	start := r.Start
+	if !r.FinalAttemptAt.IsZero() {
+		start = r.FinalAttemptAt
+	}
+	return r.FirstTokenAt.Sub(start)
+}
+
+// Recorder is the sink for per-request records. Implementations must be safe
+// for concurrent use and must never block the proxy's hot path (the recorder
+// is expected to do O(1) work; any durable storage drains asynchronously).
+type Recorder interface {
+	Record(*Record)
+}
+
+// Counters holds live, process-wide tallies exposed to the dashboard.
+type Counters struct {
+	InFlight int64 `json:"in_flight"`
+	TotalReq int64 `json:"total_requests"`
+	TotalErr int64 `json:"total_errors"`
+}

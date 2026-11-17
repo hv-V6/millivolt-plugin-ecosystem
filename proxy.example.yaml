@@ -1,0 +1,814 @@
+# millivolt configuration.
+#
+# Every server setting lives here - there are NO hardcoded configurables in the
+# code. All keys are optional; omitting one uses the built-in default (shown for
+# each key below). Every value is validated for type and range on load. A bad
+# or unknown key is dropped (the default stays) and removed from the file on
+# startup/reload; Settings POST still rejects it. Values are never silently applied.
+#
+# This file is generated from internal/config.Schema (the single registry the
+# dashboard Settings menu also uses). Copy proxy.example.yaml to a private
+# runtime config such as proxy.yaml. Edit that private file or use Settings;
+# never use the committed example as writable runtime configuration.
+# The shipped example enables Grok/OpenCode Zen/Cursor compatibility profiles
+# and the opencode sub-conversation tracking exemplar; built-in defaults
+# remain provider-neutral.
+# Header versions are editable snapshots, not verified provider contracts or
+# privacy guarantees.
+#
+# Types:
+#   string    plain text
+#   int       integer
+#   bool      true / false
+#   duration  magnitude plus unit: 500ms, 30s, 2m, 1h (0s where the key
+#             notes that zero is allowed)
+#   bytes     magnitude plus unit: 32MiB, 4KiB, 1GiB (a bare integer
+#             is still accepted as a count of bytes)
+#   list      [item, …]   map   key: value
+#
+# Clients normally supply upstream URLs and credentials per request through
+# X-Proxy-* headers. Optional provider field maps and wire headers live below.
+# Configured headers can contain secrets: keep runtime configuration private.
+
+# ---- Server ----
+# Bind address, database, and ring depth restart to apply. shutdown_timeout applies at the
+# next SIGINT/SIGTERM.
+# Host:port the HTTP server binds. Restart required.
+# Hot-reload: NO (restart required).
+#   type: string · default :8080
+listen: ":8080"
+
+# SQLite metrics store. Empty disables durability (ring only). Restart required.
+# Hot-reload: NO (restart required).
+#   type: string · default proxy.db
+db_path: "proxy.db"
+
+# In-memory ring depth and startup backfill count. Durable history and paged request logs
+# can extend beyond this window. Restart required.
+# Hot-reload: NO (restart required).
+#   type: int · range 1..1000000 · default 10000
+history_size: 10000
+
+# HTTP shutdown wait after active request contexts are canceled on SIGINT/SIGTERM. Storage
+# draining follows separately. Must be > 0; applies at the next shutdown without
+# restarting the listener.
+# Hot-reload: yes.
+#   type: duration · range > 0s · default 5s
+shutdown_timeout: 5s
+
+# How long a dashboard-triggered restart waits for in-flight streams. Expiry aborts the
+# restart and resumes accepting traffic; unfinished streams are not killed. New
+# connections queue during a successful handoff.
+# Hot-reload: yes.
+#   type: duration · range >= 0s (0s = wait indefinitely) · default 10m
+restart_drain_timeout: 10m
+
+# Slowloris guard on inbound headers. Restart required.
+# Hot-reload: NO (restart required).
+#   type: duration · range >= 0s (0s = no timeout) · default 10s
+read_header_timeout: 10s
+
+# Keep-alive idle connections. No write timeout (it would kill SSE). Restart required.
+# Hot-reload: NO (restart required).
+#   type: duration · range >= 0s (0s = no timeout) · default 2m
+idle_timeout: 2m
+
+# Soft cap on Go runtime managed memory (heap, stacks, runtime), applied once at startup.
+# 0 auto-detects a finite cgroup memory ceiling at 80% (ceilings below 80MiB are ignored)
+# and otherwise leaves the runtime unbounded. GOMEMLIMIT wins when set; GOGC is
+# independent. A set value overrides GOMEMLIMIT, not GOGC. Exceeding it turns the
+# collector more aggressive (capped near 50% CPU), never fails requests. Does not bound
+# SQLite's page cache or OS overhead. Restart required.
+# Hot-reload: NO (restart required).
+#   type: bytes · range 32MiB..1024GiB (0B = auto cgroup, else unbounded) · default 0B
+go_memory_limit: 0B
+
+# ---- Request ----
+# Inbound body cap, SSRF allowlist, optional body-preview, and debug-capture retention.
+# Inbound body the proxy will buffer to read routing metadata. Larger bodies are rejected
+# with 413.
+# Hot-reload: yes.
+#   type: bytes · range 1KiB..1GiB · default 32MiB
+max_request_bytes: 32MiB
+
+# SSRF allowlist of upstream base-URL prefixes. Empty allows any target (single trusted
+# operator). Each entry must be an absolute http:// or https:// URL with a host.
+# Hot-reload: yes.
+#   type: list of string
+allowed_base_urls: []
+
+# Store a short bounded preview of the last user prompt / response in metrics. Off by
+# default so content is not persisted.
+# Hot-reload: yes.
+#   type: bool · default false
+capture_body_preview: false
+
+# How long a full debug capture (bodies and headers) is kept after the request finishes.
+# Operator debug sessions choose which traffic is captured; this is blob retention, not
+# the session timer.
+# Hot-reload: yes.
+#   type: duration · range 1h..168h · default 24h
+debug_capture_ttl: 24h
+
+# Cap on one debug capture (request body plus client-facing response bytes). Past the cap
+# the rest is dropped and the capture is marked truncated.
+# Hot-reload: yes.
+#   type: bytes · range 4KiB..16MiB · default 1MiB
+debug_capture_max_bytes: 1MiB
+
+# Total durable debug-capture sidecar cap. New captures are skipped once the next write
+# would exceed it; TTL expiry frees capacity. Bytes, not characters. 0 = unlimited.
+# Restart required.
+# Hot-reload: NO (restart required).
+#   type: bytes · range 16MiB..8GiB (0B = unlimited) · default 512MiB
+debug_store_max_bytes: 512MiB
+
+# Exchange an expired or expiring JWT when the client sends X-Proxy-Refresh-Token. All
+# supported providers use inference handback: HTTP 401 with token_expired and access_token
+# in the error body, plus refresh_token only when the exchange returns a different
+# replacement. No inference is sent; adopt the returned credentials and retry, retaining
+# the old refresh token if no replacement is returned. Model discovery refreshes
+# transparently without returning tokens. Stateless: no reusable credentials are retained.
+# Hot-reload: yes.
+#   type: bool · default true
+auto_token_refresh: true
+
+# ---- Upstream ----
+# Connection pool, header timeout, and stream keepalives.
+# How long to wait for upstream response headers. Streaming bodies are not subject to
+# this. Transient header timeouts are retried.
+# Hot-reload: yes.
+#   type: duration · range >= 0s (0s = no header cap) · default 5m
+upstream_timeout: 5m
+
+# One upstream metadata budget for transparent key refresh, all model pages and optional
+# enrichment. Never applies to LLM streams. New discoveries use reloaded limits.
+# Hot-reload: yes.
+#   type: duration · range 1s..5m · default 30s
+models_discovery_timeout: 30s
+
+# Aggregate response bytes read after transport decoding across model pages, unary RPCs
+# and enrichment. Primary overflow fails; optional enrichment is discarded. This is not a
+# strict heap limit.
+# Hot-reload: yes.
+#   type: bytes · range 4KiB..64MiB · default 8MiB
+models_discovery_max_bytes: 8MiB
+
+# Maximum upstream model responses per discovery, including a unary RPC and optional
+# enrichment. Limits are captured once, never reset between pages.
+# Hot-reload: yes.
+#   type: int · range 1..1000 · default 100
+models_discovery_max_pages: 100
+
+# Total connections per upstream host. Sized for concurrent SSE streams, not requests/sec.
+# Hot-reload: yes.
+#   type: int · range >= 0 (0 = unlimited) · default 512
+max_conns_per_host: 512
+
+# Process-wide idle connection pool.
+# Hot-reload: yes.
+#   type: int · range >= 0 (0 = unlimited) · default 512
+max_idle_conns: 512
+
+# Idle connections kept per upstream host. Cannot exceed max conns per host when that is
+# set. net/http treats 0 as a default of 2, not unlimited, so this must be >= 1.
+# Hot-reload: yes.
+#   type: int · range >= 1 · default 512
+max_idle_conns_per_host: 512
+
+# How long an idle upstream connection is kept before closing.
+# Hot-reload: yes.
+#   type: duration · range >= 0s (0s = never expire) · default 90s
+idle_conn_timeout: 90s
+
+# How often a quiet streaming socket gets a `: keepalive` comment (queue wait, operator
+# hold, TTFB, mid-stream gaps). Range 1ns..10m. Applies to streams started after reload.
+# Hot-reload: yes.
+#   type: duration · range 1ns..10m · default 15s
+sse_keepalive_interval: 15s
+
+# ---- Queue & retry ----
+# Per-key concurrency, transparent 429/5xx retry, and quality re-asks.
+# In-flight sends per provider+key. 0 is unlimited.
+# Hot-reload: yes.
+#   type: int · range >= 0 (0 = unlimited) · default 0
+max_concurrent: 0
+
+# Queued waiters per group. 0 is unlimited. It also feeds the default queue cap of a new
+# pause hold.
+# Hot-reload: yes.
+#   type: int · range >= 0 (0 = unlimited) · default 1024
+max_queue_size: 1024
+
+# Process-wide inference admission bound. Requests above it are refused with 503 and
+# Retry-After instead of buffering their bodies. 0 = unlimited. Hot-reloads.
+# Hot-reload: yes.
+#   type: int · range 0..1000000 · default 10000
+max_inflight_requests: 10000
+
+# Process-wide budget for buffered inbound request bodies. Admission reserves the declared
+# Content-Length, or the request-body cap for chunked bodies, and refuses with 503 before
+# reading when the budget would be exceeded. 0 = unlimited. Hot-reloads.
+# Hot-reload: yes.
+#   type: bytes · range 1MiB..64GiB (0B = unlimited) · default 256MiB
+max_inflight_body_bytes: 256MiB
+
+# Process-wide budget for buffered upstream response bodies: whole-document translation of
+# non-streaming responses, the non-streaming 200 quality spool (at most 1 MiB plus one 32
+# KiB chunk), and model discovery. Admission reserves the declared Content-Length when it
+# fits the bounded read cap, otherwise that cap, and refuses with 503 and Retry-After
+# before reading when the budget would be exceeded. The reservation is released once the
+# buffer is written, translated, or abandoned. 0 = unlimited. Hot-reloads.
+# Hot-reload: yes.
+#   type: bytes · range 1MiB..64GiB (0B = unlimited) · default 256MiB
+max_inflight_response_bytes: 256MiB
+
+# How long a request may sit in the queue before 429. 0s is unlimited. Operator-hold time
+# is excluded.
+# Hot-reload: yes.
+#   type: duration · range >= 0s (0s = unlimited) · default 10m
+max_queue_wait: 10m
+
+# Transparent retries of transient 429 / 5xx / transport failures. Durable quota 429s
+# follow quota_pause_mode instead of this budget.
+# Hot-reload: yes.
+#   type: int · range >= 0 (0 = no retries) · default 5
+max_retries: 5
+
+# Retry-After hint sent when our own queue is full or the wait is exceeded. HTTP
+# Retry-After is integer seconds, so the value must be a whole number of seconds.
+# Hot-reload: yes.
+#   type: duration · range 0s..24h · default 2s
+queue_retry_after: 2s
+
+# Initial adaptive delay. Doubles each attempt and each consecutive failed request, up to
+# max backoff. A provider Retry-After/reset is a floor (never retry sooner) and does not
+# reset this doubling. Cannot exceed max backoff. Must be > 0.
+# Hot-reload: yes.
+#   type: duration · range > 0s · default 1s
+base_backoff: 1s
+
+# Cap on adaptive backoff. Does not clamp a provider Retry-After / rate-limit-reset (daily
+# limits are often 30–60m). Must be > 0.
+# Hot-reload: yes.
+#   type: duration · range > 0s · default 2m
+max_backoff: 2m
+
+# Transparent re-attempts of a degenerate 200 (empty completion, empty tool_calls), a
+# truncated stream that relayed no content yet, a retryable in-band provider error dropped
+# before the wire, and Cursor's empty-resume re-ask. 0 disables.
+# Hot-reload: yes.
+#   type: int · range 0..3 (0 = disabled) · default 1
+quality_retries: 1
+
+# Transparent rescue of requests that die or end without an answer during thinking: a
+# stream truncated or reset after reasoning-only output, a cleanly finished reasoning-only
+# completion, a retryable in-band provider error that arrived after reasoning-only output,
+# and a non-streaming reasoning-only body. The fresh attempt appends after the relayed
+# reasoning; answer content and tool calls are never rescued, and finish_reason length
+# never is. Each rescue re-sends the full request (billed). 0 disables.
+# Hot-reload: yes.
+#   type: int · range 0..3 (0 = disabled) · default 1
+thinking_retries: 1
+
+# Operator extensions to the built-in retryable in-band error vocabulary: exact type or
+# code strings (case-insensitive) that a provider reports inside a 200 and that authorize
+# a transparent re-send while no generation content was relayed. Built-ins already cover
+# server_error, the 503 overloaded/unavailable family, api_error, overloaded_error,
+# timeout_error and common gateway spellings; list custom gateway spellings here. Durable
+# quota/billing classes are rejected at load; in-band rate limits, unknown classes and
+# errors after relayed content stay verbatim. Reload applies to new rescue decisions.
+# Hot-reload: yes.
+#   type: list of string
+retryable_error_classes: []
+
+# Make the proxy the clients' sole retry authority: stamp x-should-retry: false on every
+# LLM-relay error response. The official OpenAI SDKs (python/node/go/ruby) honor it over
+# their 408/409/429/5xx auto-retry and over Retry-After, including relayed provider hints;
+# the proxy's own retry ladder has already run by then. Cannot suppress transport-level
+# failures, and clients that ignore the header (the Vercel AI SDK / opencode stack) keep
+# their own policy.
+# Hot-reload: yes.
+#   type: bool · default false
+suppress_client_retries: false
+
+# ---- Error storm protection ----
+# Bounded recovery queues for affected providers or exact model names. Hot-reloads; policy
+# changes clear observations and wake waiters. Banner visibility changes do not reset
+# protection.
+# Detect elevated upstream failure rates and queue affected sends for bounded recovery
+# probes. Opt-in; requests can still fail on cancellation, exhausted retry budgets, queue
+# limits or permanent errors. Retries can repeat upstream execution and billing.
+# Hot-reload: yes.
+#   type: bool · default false
+storm_enabled: false
+
+# Gate every model on a provider only when all active models individually meet the sample
+# and failure thresholds. Active means a request in the same detection window; idle models
+# expire.
+# Hot-reload: yes.
+#   type: bool · default true
+storm_provider_enabled: true
+
+# Gate an affected exact recorded model name within its provider. Dashboard model grouping
+# does not broaden this scope.
+# Hot-reload: yes.
+#   type: bool · default true
+storm_model_enabled: true
+
+# Show affected providers/models, safe error categories, failure percentages, queue state
+# and recovery timing at the top of the dashboard. Changing visibility does not reset
+# protection.
+# Hot-reload: yes.
+#   type: bool · default true
+storm_banner_enabled: true
+
+# Rolling time range for successful and eligible failed upstream attempts. Models with no
+# requests in this window expire from provider-wide checks.
+# Hot-reload: yes.
+#   type: duration · range 1s..1h · default 1m
+storm_window: 1m
+
+# Minimum successful or eligible failed upstream attempts in the detection window before a
+# model qualifies. Provider-wide protection requires every active model to qualify.
+# Retries count as separate attempts; this is not a distinct-request percentage.
+# Hot-reload: yes.
+#   type: int · range 1..1000000 · default 20
+storm_min_samples: 20
+
+# Minimum percentage of sampled upstream attempts with a selected failure. Applied to each
+# exact model after the minimum sample count; all active models must qualify for
+# provider-wide protection.
+# Hot-reload: yes.
+#   type: int (percent) · range 1..100 · default 50
+storm_error_percent: 50
+
+# Initial storm cooldown before a recovery probe. Cannot exceed maximum recovery delay.
+# Valid upstream Retry-After/reset hints still apply independently.
+# Hot-reload: yes.
+#   type: duration · range 1ms..1h · default 5s
+storm_initial_backoff: 5s
+
+# Cap on exponentially increased storm cooldowns. Must be at least initial recovery delay.
+# Does not shorten upstream Retry-After/reset hints.
+# Hot-reload: yes.
+#   type: duration · range 1ms..1h · default 2m
+storm_max_backoff: 2m
+
+# Multiply the storm cooldown after a failed recovery probe, up to maximum recovery delay.
+# Hot-reload: yes.
+#   type: int · range 2..10 · default 2
+storm_backoff_multiplier: 2
+
+# Random spread as a percentage of the storm cooldown to separate recovery attempts. 0
+# disables jitter.
+# Hot-reload: yes.
+#   type: int (percent) · range 0..100 (0 = no jitter) · default 20
+storm_jitter_percent: 20
+
+# Consecutive successful recovery probes required before queued traffic resumes normally.
+# Hot-reload: yes.
+#   type: int · range 1..100 · default 2
+storm_recovery_successes: 2
+
+# Maximum requests waiting for storm recovery. Excess work is rejected locally; requests
+# and their bounded bodies stay in process memory while waiting.
+# Hot-reload: yes.
+#   type: int · range 1..100000 · default 1000
+storm_max_queue: 1000
+
+# Maximum duration of each storm gate wait, not total request duration across all retries
+# and other queues. Caller cancellation may end the wait earlier.
+# Hot-reload: yes.
+#   type: duration · range 1ms..24h · default 5m
+storm_max_wait: 5m
+
+# Bound on provider and exact-model detector scopes retained in process memory. Increasing
+# it does not establish a total process memory ceiling.
+# Hot-reload: yes.
+#   type: int · range 2..100000 · default 2048
+storm_max_scopes: 2048
+
+# Additional retries beyond max_retries only while a relevant storm is active and the
+# failure matches a selected eligible transient condition. Does not replay meaningful
+# emitted upstream content. 0 keeps the ordinary retry budget.
+# Hot-reload: yes.
+#   type: int · range 0..1000 (0 = no additional retries) · default 20
+storm_max_retries: 20
+
+# Exact status strings selected for detection and additional storm retries: 429 or
+# 500..599, without duplicates. Empty disables HTTP status triggers. 429 is opt-in because
+# limits may be credential-specific; durable quota/billing 429s remain excluded from storm
+# evidence (quota_pause_mode owns their reaction).
+# Hot-reload: yes.
+#   type: list of string
+storm_status_codes:
+  - "500"
+  - "502"
+  - "503"
+  - "504"
+
+# Include transport failures already eligible for the shared retry policy. Caller
+# cancellation and permanent transport errors are excluded.
+# Hot-reload: yes.
+#   type: bool · default true
+storm_transport_errors: true
+
+# Include recorded in-band, stream and quality failures to protect future sends. Reports a
+# generic response error without retaining error bodies for the banner. Never replays
+# meaningful emitted upstream content.
+# Hot-reload: yes.
+#   type: bool · default true
+storm_stream_errors: true
+
+# ---- Quota pause ----
+# Provider-wide reaction to a 429 carrying a durable quota/billing error
+# (insufficient_quota/credits, spend limits): surface it immediately, park the provider
+# behind a recovery gate, or hold it until an operator resumes.
+# Reaction to a 429 carrying a durable quota/billing error (insufficient_quota/credits,
+# spend limits; in-band occurrences included): off surfaces it immediately; retry opens a
+# provider-wide recovery gate - the triggering request absorbs the 429 and re-sends per
+# the storm recovery delays, new requests park on the gate (bounded by
+# storm_max_queue/storm_max_wait), and the first 2xx closes it; manual creates an
+# indefinite provider pause that only an operator resumes. Classification is fixed; only
+# the reaction is configurable.
+# Hot-reload: yes.
+#   type: string · default off
+quota_pause_mode: "off"
+
+# Consecutive successful recovery probes that close a retry-mode quota gate. 1 releases
+# the queue on the first 2xx. Meaningful only in retry mode.
+# Hot-reload: yes.
+#   type: int · range 1..100 · default 1
+quota_pause_recovery_successes: 1
+
+# ---- Conversations ----
+# How the request log groups turns into conversations.
+# A gap longer than this starts a new conversation for the same client+key. Generous so
+# thinking pauses inside one task don't split it. Must be > 0.
+# Hot-reload: yes.
+#   type: duration · range > 0s · default 30m
+conversation_idle_gap: 30m
+
+# Cap on concurrently-open conversations per client+key. Oldest is evicted past it.
+# Hot-reload: yes.
+#   type: int · range 1..100000 · default 64
+conversation_max_open: 64
+
+# Per-client tracking of a request body field that carries a sub-conversation identity,
+# exemplified by opencode's promptCacheKey. Each entry names one classified client exactly
+# (no wildcard, no case folding) plus 1..4 exact JSON field names matched only at the
+# request body's top level; the first present field decides (duplicate top-level keys
+# resolve by their first occurrence): a present value that is not a JSON string value
+# counts as absent and the next field is checked, while a present string that cannot be
+# decoded or fails the identity rules (non-empty after trimming, valid UTF-8, free of
+# control bytes, at most 512 bytes) drops the identity for the request - no later field is
+# consulted - and a dropped identity is never a client error. The drop is conservative: a
+# value whose raw spelling exceeds the bounded scan window is dropped even when its
+# trimmed form would pass. The value groups the request under a k: conversation identity,
+# after the X-Proxy-Session header (s:) and before automatic client+key grouping;
+# X-Proxy-Parent-Session still owns parent linkage. Requests translated to the Anthropic
+# wire gain a top-level prompt_cache_key carrying the value. strip: true removes the
+# entry's configured fields from the top level of the relayed upstream passthrough body;
+# the default false forwards the body unchanged. Param names are exact printable-ASCII
+# JSON key segments up to 64 bytes, no quotes or backslashes; duplicate clients and
+# duplicate params within an entry are rejected. Caps: 16 entries, 4 params per entry.
+# Default: an empty list, tracking fully off. Hot-reloads.
+# Hot-reload: yes.
+#   type: ordered list of {client, params, strip} per-client tracked body params · default []
+sub_conversations:
+  - client: "opencode"
+    params:
+      - "promptCacheKey"
+    strip: true
+
+# ---- Format translation ----
+# Anthropic defaults and Cursor agent.v1 bridging.
+# Injected into translated Anthropic requests when the client sent neither max_tokens nor
+# max_completion_tokens.
+# Hot-reload: yes.
+#   type: int (tokens) · range 1..1000000 · default 4096
+anthropic_default_max_tokens: 4096
+
+# Optional context-window hint stamped onto every model in GET /v1/models when
+# X-Proxy-Format is cursor. 0 omits the field.
+# Hot-reload: yes.
+#   type: int (tokens) · range >= 0 (0 = omit (client default)) · default 0
+cursor_default_context_window: 0
+
+# How long a parked Cursor Run stream stays open waiting for tool results. Must be > 0.
+# Expiry closes the stream; the next continuation cold-starts.
+# Hot-reload: yes.
+#   type: duration · range > 0s · default 3h
+cursor_park_ttl: 3h
+
+# How often the proxy pings a Cursor agent.v1 run (idle parked runs included). Range
+# 1ns..10m. Applies to runs created after reload.
+# Hot-reload: yes.
+#   type: duration · range 1ns..10m · default 5s
+cursor_heartbeat_interval: 5s
+
+# ---- Storage ----
+# Durable SQLite write pipeline. Restart to apply.
+# Buffered records before overflow drops. Restart required.
+# Hot-reload: NO (restart required).
+#   type: int · range 1..1000000 · default 8192
+storage_write_chan_cap: 8192
+
+# Max records per SQLite transaction. Cannot exceed the write channel cap. Restart
+# required.
+# Hot-reload: NO (restart required).
+#   type: int · range >= 1 · default 256
+storage_batch_cap: 256
+
+# Partial-batch flush cadence. Must be > 0 (a zero ticker panics). Restart required.
+# Hot-reload: NO (restart required).
+#   type: duration · range > 0s · default 500ms
+storage_flush_interval: 500ms
+
+# Bounds dashboard SELECT queries. Must be > 0. Open and AggAPI bind at start (restart
+# required); pause/throttle persist reads the live snapshot.
+# Hot-reload: NO (restart required).
+#   type: duration · range > 0s · default 10s
+storage_query_timeout: 10s
+
+# Maximum JSON bytes returned by /metrics/query; also bounds SQLite string/blob values.
+# Oversized results fail with HTTP 413, never truncate. Does not cap all SQLite working
+# memory. Restart required.
+# Hot-reload: NO (restart required).
+#   type: bytes · range 4KiB..64MiB · default 8MiB
+storage_query_max_bytes: 8MiB
+
+# Maximum rows returned by /metrics/query. Oversized results fail with HTTP 413; use SQL
+# filters or LIMIT. Does not limit dashboard aggregates or exports. Restart required.
+# Hot-reload: NO (restart required).
+#   type: int · range 1..100000 · default 10000
+storage_query_max_rows: 10000
+
+# ---- Backup ----
+# Download or restore a self-checked archive of the saved config, the SQLite history, or
+# both. Restore inspects first: merge keeps live defaults and live request ids; replace
+# writes the backup as-is.
+# Maximum size of one Settings backup download or restore upload. Larger archives are
+# refused. Downloads and restores stream through private staging files; this is the
+# admit/reject ceiling, not a heap guarantee.
+# Hot-reload: yes.
+#   type: bytes · range 1MiB..4GiB · default 1GiB
+backup_max_bytes: 1GiB
+
+# ---- MCP ----
+# The operator-gated /mcp LLM tool endpoint: mcp_enabled registers the route or keeps it
+# reserved (404, never inference), and the limits bound what its tools return to a model.
+# Restart to apply; the route table and the endpoint's services are built once at boot.
+# Register the streamable HTTP MCP endpoint at /mcp for LLM tool clients, operator-gated
+# and Bearer-only like /metrics. Off keeps the route reserved (404, never inference); the
+# /mcp/ look-alike reservation and the operator gate stay either way. Restart required.
+# Hot-reload: NO (restart required).
+#   type: bool · default true
+mcp_enabled: true
+
+# Default page for the records, values and audit capture listings the endpoint serves to a
+# model. Restart required.
+# Hot-reload: NO (restart required).
+#   type: int · range 10..500 · default 50
+mcp_page_size: 50
+
+# Default client-side row limit when a query call omits max_rows. An explicit max_rows may
+# raise it up to this setting's maximum; the proxy's own storage_query_max_rows still
+# answers 413 first. Restart required.
+# Hot-reload: NO (restart required).
+#   type: int · range 1..100000 · default 200
+mcp_query_max_rows: 200
+
+# Client-side cap on the encoded size of one query tool result. Keeps whole rows,
+# truncating with an explicit marker rather than silently. Restart required.
+# Hot-reload: NO (restart required).
+#   type: bytes · range >= 1B · default 128KiB
+mcp_query_max_bytes: 128KiB
+
+# Size above which a stored capture document is withheld whole from the audit_capture_get
+# tool; a document that large is more than a model should read in one call. Restart
+# required.
+# Hot-reload: NO (restart required).
+#   type: bytes · range >= 1B · default 256KiB
+mcp_capture_max_bytes: 256KiB
+
+# Bounds one proxy read the endpoint makes that is not the proxy's own bounded SQL reader
+# (a full-history chart or explorer fold can take seconds). Must be > 0. Restart required.
+# Hot-reload: NO (restart required).
+#   type: duration · range > 0s · default 2m
+mcp_query_timeout: 2m
+
+# Bounds every in-process call the endpoint's tools make to the proxy, including
+# mutations. Must be > 0. Restart required.
+# Hot-reload: NO (restart required).
+#   type: duration · range > 0s · default 30s
+mcp_timeout: 30s
+
+# ---- Dashboard ----
+# Live-view cadence and request-log window. Hot-reloads; open dashboards pick up the next
+# tick.
+# Page size of the live request log (newest first). Scrolling near the bottom loads more,
+# including older durable history.
+# Hot-reload: yes.
+#   type: int · range 10..500 · default 60
+dash_log_rows: 60
+
+# KPI / pause / SSE-fallback poll cadence. Must be > 0.
+# Hot-reload: yes.
+#   type: duration · range > 0s · default 5s
+dash_poll_interval: 5s
+
+# How often the traffic chart re-fetches server-authoritative buckets and period totals.
+# Must be > 0.
+# Hot-reload: yes.
+#   type: duration · range > 0s · default 15s
+dash_chart_refresh: 15s
+
+# How old a cached explorer breakdown may be before it is re-fetched. Must be > 0.
+# Hot-reload: yes.
+#   type: duration · range > 0s · default 15s
+dash_explorer_stale: 15s
+
+# Keep the dashboard current while its tab is hidden: the poll runs at the browser's
+# throttled background cadence (about one wake per minute on Chromium) and a Web Lock
+# keeps the SSE feed from being frozen. Desktop Chromium only; Android and iOS still
+# suspend background pages at the OS level. Off keeps the current pause-while-hidden
+# behavior.
+# Hot-reload: yes.
+#   type: bool · default false
+dash_background_refresh: false
+
+# ---- Models ----
+# Model grouping rules - an ordered rewrite pipeline merging spelling variants of the same
+# model in every grouped surface. Records keep their exact spelling; hot-reloads.
+# Ordered rewrite pipeline that merges spelling variants of the same model in every
+# grouped surface (explorer model dimension, scope filters, debug checklist, Clear/Logs
+# optgroups, and the request-log leaf’s displayed name). Each rule is one step: exact
+# (whole-string merge old → new), pattern (regex rewrite of all occurrences, $1 capture
+# refs), lower (fold case). Rules apply once in order; the shipped default folds case,
+# strips a `vendor/` namespace, strips a trailing `:tag`, strips a trailing
+# architecture/quant suffix (`-fp4`, `-nvfp4`, `-bf16`, `-int8`, `-q4_k_m`), and unifies
+# `.` with `-` between digits. An explicitly empty list groups by the exact stored
+# spelling. Stored values remain unchanged; purge/export match them exactly and request
+# details show the original. Debug matching uses separate native base-model normalization,
+# not these display rules. Hot-reloads.
+# Hot-reload: yes.
+#   type: ordered list of {mode: exact|pattern|lower, from, to} rewrite rules · default: the shipped pipeline (lower · strip vendor/ · strip :tag · strip architecture/quant suffix · unify . and - between digits); restorable in Settings with ↺ default pipeline
+model_rules:
+  - {mode: lower, from: "", to: ""}
+  - {mode: pattern, from: "^[a-z0-9][a-z0-9._-]*/", to: ""}
+  - {mode: pattern, from: ":[a-z0-9._-]+$", to: ""}
+  - {mode: pattern, from: "-(?:[a-z]{0,2}fp\\d+|bf\\d+|int\\d+|nf\\d+|[a-z]?q\\d+(?:_[0-9a-z]+)*)$", to: ""}
+  - {mode: pattern, from: "(\\d)\\.(\\d)", to: "$1-$2"}
+
+# ---- Providers ----
+# Optional per-provider JSON field-name maps: usage/cost response keys, the models
+# metadata endpoint merged into /v1/models, ensured tool names injected into relayed chat
+# bodies, and optional upstream wire headers. Empty = auto-detect.
+# Per-provider cost/usage JSON field paths, optional models_path/models_keys enrichment,
+# ensured tool names and headers (a string map). Field names only, never static prices.
+# Custom cost_keys must report USD; leave cost_in_usd_ticks to automatic unit conversion.
+# ensure_tools names function tools injected as inert stubs into relayed OpenAI-wire chat
+# bodies missing them, with tool_choice none added when the client sent no tools, so a
+# first-party client's tool-signature gate still recognizes the request. Header values
+# expand {{uuid4}} to a fresh UUID, {{platform}} to the server's Rust-style os; arch pair,
+# and {{opencode-msg-id}}/{{opencode-ses-id}} to fresh opencode-format identifiers;
+# unknown templates stay literal. On HTTP relay requests, configured headers override
+# forwarded/extracted-auth values and X-Proxy-Headers wins. Model discovery and the Cursor
+# bridge construct headers separately and do not apply X-Proxy-Headers. Headers can
+# contain secrets; keep runtime configuration private.
+# Hot-reload: yes.
+#   type: map of provider label → {cost_keys, usage_keys, models_path, models_keys, ensure_tools, headers}
+providers:
+  "cursor.sh":
+    cost_keys: []
+    usage_keys: {}
+    models_path: ""
+    models_keys: {}
+    ensure_tools: []
+    headers:
+      "X-Cursor-Agent-Allowed-Tools": "mcp_tool_call"
+      "x-cursor-client-type": "cli"
+      "x-cursor-client-version": "cli-2026.08.11-0000000"
+      "x-ghost-mode": "true"
+      "x-request-id": "{{uuid4}}"
+  "opencode.ai":
+    cost_keys: []
+    usage_keys: {}
+    models_path: ""
+    models_keys: {}
+    ensure_tools:
+      - "bash"
+      - "read"
+    headers:
+      "User-Agent": "opencode/1.18.32 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+      "x-opencode-client": "cli"
+      "x-opencode-project": "global"
+      "x-opencode-request": "{{opencode-msg-id}}"
+      "x-opencode-session": "{{opencode-ses-id}}"
+  "x.ai":
+    cost_keys: []
+    usage_keys: {}
+    models_path: "/language-models"
+    models_keys:
+      "input_modalities": "input_modalities"
+      "output_modalities": "output_modalities"
+    ensure_tools: []
+    headers:
+      "User-Agent": "grok-shell/1.0.13 ({{platform}})"
+      "x-grok-client-identifier": "grok-shell"
+      "x-grok-client-version": "1.0.13"
+      "x-grok-req-id": "{{uuid4}}"
+
+# Map an old provider label to a canonical label. Rewrites existing stored history at boot
+# and on reload; new requests use the canonical label. Existing in-memory records keep
+# their prior label until they age out or the process restarts. Removing a mapping does
+# not restore rewritten history. Chains and self-maps are rejected.
+# Hot-reload: yes.
+#   type: map of old provider label → canonical label
+provider_aliases: {}
+
+# ---- Request overrides ----
+# Scoped rewrites of the upstream request: set, replace or remove HTTP headers and set
+# output-token ceilings per client, provider and/or model. Rules match exactly, all
+# matching rules apply in list order, and the later rule wins. Default: an empty list, the
+# feature fully off.
+# Ordered rules that rewrite the upstream request before relay. A rule matches when every
+# non-empty scope field equals the request's value exactly: client as the classified
+# client, provider as the canonical label after provider_aliases, model as the recorded
+# model id; an empty scope field matches anything. All matching rules apply in list order,
+# and for the same header or body field the later rule wins. headers sets or replaces
+# upstream headers (names are canonicalized, values must be non-empty single-line),
+# remove_headers deletes them, and body sets max_tokens / max_completion_tokens
+# (1..1000000) on the OpenAI wire. Credential and protocol headers (such as authorization,
+# cookie, host, content-type, and the whole x-proxy- control prefix) are rejected at load.
+# The override applies after provider headers and the client's X-Proxy-Headers map and
+# wins over both; it covers inference sends only, never model discovery or token refresh.
+# Body rewrites apply to passthrough and translated-anthropic requests and re-stamp the
+# recorded request cap; the Cursor bridge reads no body fields, so body is skipped for
+# cursor targets while header rules still apply. An empty list leaves every request
+# untouched. Hot-reloads.
+# Hot-reload: yes.
+#   type: ordered list of {client, provider, model, headers, remove_headers, body} upstream rewrite rules · default []
+request_overrides: []
+
+# ---- Plugins ----
+# Declarative rule packs loaded from a directory at boot and reload. Rule packs contribute
+# data only, never code, and cannot change boot-bound settings. Restart to apply directory
+# changes.
+# Load YAML rule packs from plugin_dir at boot and on reload. Each pack may contribute
+# only provider_aliases, model_rules, providers, request_overrides and sub_conversations;
+# any other key, oversized file, or invalid merged config fails closed. Rules append in
+# filename order and all existing caps still apply. Restart required.
+# Hot-reload: NO (restart required).
+#   type: bool · default false
+plugins_enabled: false
+
+# Directory of direct .yaml/.yml rule packs, read in sorted filename order. Empty disables
+# loading. Files are size-capped and must be regular files; symlinks and unknown keys are
+# refused. Restart required.
+# Hot-reload: NO (restart required).
+#   type: string · default 
+plugin_dir: ""
+
+# Optional JSON file of SHA-256 token digests and capability scopes for plugin clients.
+# Raw tokens are never stored here and are excluded from config backups. Empty disables
+# scoped credentials; only the full operator token is accepted. Restart required.
+# Hot-reload: NO (restart required).
+#   type: string · default 
+plugin_credentials_file: ""
+
+# Optional JSON file of Ed25519 public keys keyed by signer id. Empty permits unsigned
+# development manifests; when set, every plugin manifest must carry a valid signer and
+# signature. Restart required.
+# Hot-reload: NO (restart required).
+#   type: string · default 
+plugin_trust_file: ""
+
+# Optional JSON file pinning module filenames to SHA-256 digests. A pinned module with a
+# changed digest fails boot until pins are refreshed through /admin/plugins. Restart
+# required for pin changes to load.
+# Hot-reload: NO (restart required).
+#   type: string · default 
+plugin_lock_file: ""
+
+# Optional directory of .mvplugin files scanned on demand by the operator install route.
+# Empty disables inbox scanning. Files are size-capped and must be regular files; symlinks
+# are refused. Restart required.
+# Hot-reload: NO (restart required).
+#   type: string · default 
+plugin_inbox_dir: ""
+
+# Permit the operator install and update routes to fetch signed plugins from allowlisted
+# GitHub release URLs. Remote plugin sources are refused while false. Restart required.
+# Hot-reload: NO (restart required).
+#   type: bool · default false
+plugin_downloads_enabled: false
+
+# Exact host[:port] allowlist for the generic http:fetch plugin capability. Empty disables
+# all outbound guest fetches. Guests never receive credentials; the host enforces this
+# allowlist, GET-only methods, a 5s timeout, and a 64 KiB response cap. Restart required.
+# Hot-reload: NO (restart required).
+#   type: list of string
+plugin_http_allow_hosts: []

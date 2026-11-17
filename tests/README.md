@@ -1,0 +1,104 @@
+# Tests
+
+All test sources and disposable test harnesses live here. Operational commands
+remain in `cmd/` and `scripts/`. Run commands below from the repository root.
+
+## Shared entry point
+
+```sh
+scripts/check.sh core
+scripts/check.sh go test -mod=readonly ./internal/config -count=1
+scripts/check.sh go test -mod=readonly -race ./... -count=1
+scripts/check.sh go vet ./...
+scripts/check.sh go list -json ./internal/config
+scripts/check.sh go mod tidy -diff
+npm test
+```
+
+`scripts/check.sh` owns the local/CI check sequence. `go test ./...` without this
+entry point does **not** discover the relocated package tests; it can succeed
+with no tests run. Likewise, use the overlay-aware command for vet and module
+tidying so test code and test-only dependencies are included.
+
+## Go source layout
+
+`_go/` mirrors each tested package's original path, without a redundant `_test`
+suffix on physical files. For example, `tests/_go/internal/config/config.go`
+is compiled as the virtual file `internal/config/config_test.go`.
+`tests/go.py` discovers every Go file in that tree and appends Go's required
+virtual suffix through a temporary native `-overlay` manifest. It changes no production source,
+exports no private APIs, and uses the root `go.mod` and `go.sum` only.
+
+The runner checks physical-file/native-package discovery parity, rejects
+misplaced, duplicate and symlinked tests, and removes its private manifest on
+success or failure. The `_go` directory is intentionally excluded from Go's
+normal recursive package walk. It also fails when Go ignores a test for any
+reason other than a genuine GOOS/GOARCH exclusion. A platform filename suffix
+is necessary but not sufficient: the file's own build constraints must name
+only platform tags and select at least one platform consistent with that
+suffix. A `//go:build integration` file is therefore a hard error rather than
+a silently unrun test, including a platform-suffixed file such as
+`value_linux.go` with `//go:build integration`. New Go tests and their helpers
+use ordinary `.go` filenames inside the mirrored tree. Platform filename
+suffixes retain their native Go meaning. Build constraints still apply inside
+files Go does compile, but one that excludes a test entirely is rejected as a
+silent skip; `_test` exists only in the temporary virtual filenames.
+
+Package-private access, source-package working directories, benchmarks, fuzz
+tests and race detection are retained. Runtime file reads do not see virtual
+files: read real fixtures, not a relocated test's virtual source filename.
+Editors and debuggers do not automatically learn this mapping; test discovery,
+navigation and clickable stack paths may need tool-specific configuration.
+No global `go env -w` setting or persistent machine-specific manifest is needed.
+The runner owns `-overlay`, the working directory and the module file, and
+disables an inherited Go workspace. Use `gofmt` on the physical files under
+`tests/_go`, not the nonexistent virtual paths.
+
+These behaviors are verified against the Go version in the root module. See
+the official [Go command documentation](https://pkg.go.dev/cmd/go) for overlay
+and package-pattern limitations.
+
+## Parallel race shards
+
+`scripts/check.sh core` builds one race test binary per package, then runs
+disjoint top-level test groups through `tests/shard.py`. Temp-isolated packages
+split across several processes; fixed-port packages such as `cmd/proxy` stay
+single-process. Every name returned by `go test -list` is assigned exactly once,
+so a new test cannot silently fall outside the selected shards. The runner
+keeps the overlay, `-race`, `-count=1`, package working directory, and the
+bounded `-benchtime=200ms` for the allocation tests that call
+`testing.Benchmark` internally. Set `MILLIVOLT_TEST_WORKERS` to cap local
+parallelism, or use `python3 -B -O -m tests.shard --shard INDEX/TOTAL` for a CI
+matrix. The fixed-port packages remain serial because separate processes would
+collide on the same loopback fixture port.
+
+The MCP server's live test is opt-in, because it starts a private dev instance
+and generates loopback fixture traffic. It never targets port 8080, and it owns
+its instance through `scripts/dev.sh`:
+
+```sh
+MILLIVOLT_MCP_INTEGRATION=1 scripts/check.sh go test -count=1 ./internal/mcp
+```
+
+## Python and browser harnesses
+
+Python unit tests live in `python/`, separate from the harnesses they test.
+Run them as modules from the repository root, not as standalone scripts:
+
+```sh
+python3 -B -O -m tests.python.go
+python3 -B -O -m tests.python.repository
+python3 -B -O -m tests.python.backup_db
+python3 -B -O -m tests.python.release
+python3 -B -O -m tests.python.browser
+scripts/check.sh browser --target http://127.0.0.1:8081
+python3 -B -O -m tests.explorer_check --target http://127.0.0.1:8081 --docs-history /tmp/millivolt-docs-images
+scripts/check.sh container --image sha256:YOUR_LOCAL_IMAGE_ID
+```
+
+Browser commands require installed Playwright/Chromium and a verified private
+instance owned by `scripts/dev.sh`; they never start or restart it. Port 8080
+is rejected. Documentation-history capture additionally requires a validated
+sanitized copy and public example configuration before opening dashboard data.
+It cannot submit inference or operator mutations. Container checks own only
+their disposable local image/container/volume fixtures.

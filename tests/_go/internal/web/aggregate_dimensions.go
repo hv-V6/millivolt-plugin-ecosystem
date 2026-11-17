@@ -1,0 +1,219 @@
+package web
+
+import (
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+	"unsafe"
+
+	"github.com/LLM-4-People/millivolt/internal/config"
+	"github.com/LLM-4-People/millivolt/internal/storage"
+)
+
+func TestProjectionDropsStoredLabels(t *testing.T) {
+	var d contribDimensions
+	want := map[int]string{
+		dimClient:       "fixture-client",
+		dimProvider:     "fixture.example",
+		dimModel:        "MODEL-A",
+		dimConversation: "conversation",
+		dimKey:          "key-hash",
+	}
+	first := contrib{
+		labels: &contribLabels{
+			client: want[dimClient], prov: want[dimProvider], model: want[dimModel],
+			conv: want[dimConversation], key: want[dimKey],
+		},
+		status: 200,
+	}
+	d.intern(&first)
+	if first.labels != nil {
+		t.Fatal("projected row retained the live label sidecar")
+	}
+	for dim, name := range want {
+		id := first.dimensionIDs[dim]
+		if got := d.dict[dim].names[id]; got != name {
+			t.Fatalf("%s = %q, want %q", dimensionNames[dim], got, name)
+		}
+	}
+	for range 16 {
+		row := contrib{
+			labels: &contribLabels{
+				client: strings.Clone(want[dimClient]), prov: strings.Clone(want[dimProvider]),
+				model: strings.Clone(want[dimModel]), conv: strings.Clone(want[dimConversation]),
+				key: strings.Clone(want[dimKey]),
+			},
+			status: 200,
+		}
+		d.intern(&row)
+		if row.labels != nil {
+			t.Fatal("projected row retained the live label sidecar")
+		}
+		for dim := range want {
+			if row.dimensionIDs[dim] != first.dimensionIDs[dim] {
+				t.Fatalf("%s duplicate changed slot: %d != %d", dimensionNames[dim], row.dimensionIDs[dim], first.dimensionIDs[dim])
+			}
+		}
+	}
+	for _, dim := range []int{dimClient, dimProvider, dimModel, dimConversation, dimKey} {
+		if len(d.dict[dim].names) != 2 || d.dict[dim].counts[1] != 17 {
+			t.Fatalf("%s duplicate changed membership: %+v", dimensionNames[dim], d.dict[dim])
+		}
+	}
+}
+
+func TestProjectionEmptyModelCanonicalization(t *testing.T) {
+	for _, replacement := range []string{"unknown", ""} {
+		t.Run(replacement, func(t *testing.T) {
+			mcz := &modelCanonizer{exec: config.CompileModelRules([]config.ModelRule{{Mode: config.ModelRulePattern, From: "^$", To: replacement}}), memo: map[string]string{}}
+			p := &projectionData{rows: []contrib{{id: "stored", status: 200, start: 1000, ttft: 10, tps: 2, rowIndex: 1}}}
+			p.dimensions.intern(&p.rows[0])
+			fs := []scopeFilter{{dim: "model", id: replacement}}
+			bound := bindScope(fs, p, mcz)
+			if !scopedMatch(&p.rows[0], "", bound) {
+				t.Fatal("projection lost valid empty-model canonicalization")
+			}
+			if fs[0].ids != nil {
+				t.Fatal("bound scope mutated caller")
+			}
+			raw, indexed := newExplorerFold("model", "", fs), newExplorerFold("model", "", fs)
+			indexed.prepare(p, mcz)
+			c := p.rows[0]
+			c.dimensionIDs = [dimTool]uint32{}
+			c.rowIndex = 0
+			c.labels = &contribLabels{model: mcz.model("")}
+			_ = raw.fold(&c)
+			_ = indexed.fold(&p.rows[0])
+			if got, want := indexed.payload(), raw.payload(); !reflect.DeepEqual(got, want) {
+				t.Fatalf("empty model parity: got %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// TestProjectionToolNamesShareDictionaryBytes pins the tool-name repoint in
+// intern: the per-row decode copies must become garbage after interning, not
+// stay live for the history's lifetime. Pointer inspection is test-only;
+// production uses ordinary immutable Go strings.
+func TestProjectionToolNamesShareDictionaryBytes(t *testing.T) {
+	var d contribDimensions
+	row := contrib{status: 200, toolsL: []string{strings.Clone("web_search"), strings.Clone("bash_exec")}}
+	d.intern(&row)
+	for i, name := range row.toolsL {
+		canonical := d.dict[dimTool].names[row.toolIDs[i]]
+		if name != canonical || unsafe.StringData(name) != unsafe.StringData(canonical) {
+			t.Fatalf("tool name %q retained a per-row copy instead of dictionary bytes", name)
+		}
+	}
+	for _, id := range row.toolIDs {
+		if d.dict[dimTool].counts[id] != 1 {
+			t.Fatalf("tool membership drifted: %+v", d.dict[dimTool])
+		}
+	}
+}
+
+func TestProjectionParentIdentitySharesConversationDictionary(t *testing.T) {
+	var d contribDimensions
+	parentName := strings.Repeat("parent", 30)
+	child := contrib{labels: &contribLabels{conv: "child", parentConv: parentName}, status: 200}
+	d.intern(&child)
+	if child.labels != nil {
+		t.Fatal("projected row retained the live label sidecar")
+	}
+	parentID := d.dict[dimConversation].ids[parentName]
+	if parentID == 0 || child.parentConvID != parentID || d.dict[dimConversation].counts[parentID] != 0 {
+		t.Fatal("a referenced parent fabricated an observed membership")
+	}
+	parent := contrib{labels: &contribLabels{conv: strings.Clone(parentName)}, status: 200}
+	d.intern(&parent)
+	if parent.dimensionIDs[dimConversation] != parentID || d.dict[dimConversation].counts[parentID] != 1 {
+		t.Fatal("parent identity failed to reuse its conversation dictionary slot/count")
+	}
+}
+
+// TestDimensionNamesMirrorExplorerRail pins the dimension dictionary's name
+// set. The dictionary indices are internal slots, but the NAMES own the API
+// dimension allowlist (validDims) and are what the explorer rail mirrors
+// (XP_RAIL_DIMS in explorer.js, whose order the jsdom suite pins). A
+// renamed, added or removed dimension must redden here instead of silently
+// stranding the browser rail or the filter grammar. Set equality is
+// order-independent against the rail; the array's own order is pinned too
+// because it defines the dictionary slot indices.
+func modelCacheProjection(t *testing.T, models int) *projectionData {
+	t.Helper()
+	rows := make([]contrib, models)
+	for i := range rows {
+		rows[i] = contrib{labels: &contribLabels{model: fmt.Sprintf("Vendor/Model-%d", i)}, status: 200}
+	}
+	p, err := buildProjection(rows, storage.ProjectionCursor{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &p
+}
+
+// The canonical model IDs and dictionary are projection-owned: consecutive
+// requests share the immutable snapshot, a rules change rebuilds it, a
+// non-destructive version bump extends it, and a destructive replacement
+// publishes a fresh cache.
+func TestProjectionModelCacheReuseAndInvalidation(t *testing.T) {
+	p := modelCacheProjection(t, 1000)
+	lower := &modelCanonizer{
+		exec:     config.CompileModelRules([]config.ModelRule{{Mode: config.ModelRuleLower}}),
+		identity: "lower",
+		memo:     map[string]string{},
+	}
+	var first, second queryDimensions
+	first.prepare(p, lower)
+	second.prepare(p, lower)
+	if len(first.modelIDs) != 1001 || len(second.modelIDs) != 1001 {
+		t.Fatalf("canonical IDs = %d/%d, want 1001", len(first.modelIDs), len(second.modelIDs))
+	}
+	if &first.modelIDs[0] != &second.modelIDs[0] || &first.base[dimModel].names[0] != &second.base[dimModel].names[0] {
+		t.Fatal("consecutive requests re-canonicalized the projection")
+	}
+	if got := first.base[dimModel].names[first.modelIDs[1]]; got != "vendor/model-0" {
+		t.Fatalf("canonical model = %q", got)
+	}
+	raw := &modelCanonizer{identity: "raw", memo: map[string]string{}}
+	var rulesChanged queryDimensions
+	rulesChanged.prepare(p, raw)
+	if rulesChanged.base[dimModel].names[rulesChanged.modelIDs[1]] != "Vendor/Model-0" {
+		t.Fatal("rules change reused the old canonical dictionary")
+	}
+	// A version bump with an unchanged raw dictionary is a cache hit, not a
+	// rebuild; a new raw name extends the prefix in place.
+	names := p.dimensions.dict[dimModel].names
+	ids, _ := p.modelCache.canonical(p.version+1, raw.identity, names, raw)
+	if len(ids) != len(names) || &ids[0] != &rulesChanged.modelIDs[0] {
+		t.Fatal("unchanged model dictionary rebuilt on an append version")
+	}
+	extended := append(append([]string(nil), names...), "vendor/model-new")
+	ids, models := p.modelCache.canonical(p.version+2, raw.identity, extended, raw)
+	if len(ids) != len(extended) || models.names[ids[len(extended)-1]] != "vendor/model-new" {
+		t.Fatalf("extended dictionary = %q", models.names[ids[len(extended)-1]])
+	}
+	if ids[1] != rulesChanged.modelIDs[1] {
+		t.Fatal("extension did not retain the immutable canonical prefix")
+	}
+	replacement := modelCacheProjection(t, 10)
+	if replacement.modelCache == p.modelCache {
+		t.Fatal("destructive replacement reused the previous cache")
+	}
+}
+
+func TestDimensionNamesMirrorExplorerRail(t *testing.T) {
+	want := []string{"client", "provider", "model", "conversation", "key", "status", "time", "tool", "error"}
+	if !reflect.DeepEqual(dimensionNames[:], want) {
+		t.Fatalf("dimensionNames = %v, want %v (the explorer rail's dimension set, in dictionary slot order)", dimensionNames[:], want)
+	}
+	if len(validDims) != len(want) {
+		t.Fatalf("validDims = %v, want exactly the rail dimensions accepted", validDims)
+	}
+	for _, name := range want {
+		if !validDims[name] {
+			t.Fatalf("validDims[%q] = false, want every rail dimension accepted by the explorer API", name)
+		}
+	}
+}

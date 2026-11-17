@@ -1,0 +1,383 @@
+package format
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// nestValueList wraps value bytes as one more google.protobuf.Value
+// list_value level: Value{list_value: ListValue{values: [inner]}}, so the
+// wire form is field 6 (list_value) containing a ListValue whose field 1
+// (values) entry is the inner Value. Each wrapper adds one recursion level.
+func nestValueList(inner []byte) []byte {
+	list := append(appendVarint([]byte{0x0a}, uint64(len(inner))), inner...) // ListValue.values = inner
+	return append(appendVarint([]byte{0x32}, uint64(len(list))), list...)    // Value.list_value = list
+}
+
+// nestValueStruct wraps value bytes as one more google.protobuf.Value
+// struct_value level: Value{struct_value: Struct{fields: {"k": inner}}}, so
+// the wire form is field 5 (struct_value) containing a Struct whose single
+// field-1 map entry carries key "k" (field 1) and the inner Value (field 2).
+// Each wrapper adds one recursion level, exactly like nestValueList.
+func nestValueStruct(inner []byte) []byte {
+	entry := append(appendVarint([]byte{0x0a}, uint64(len("k"))), 'k') // map entry field 1 = "k"
+	entry = append(entry, 0x12)                                        // map entry field 2 = inner Value
+	entry = appendVarint(entry, uint64(len(inner)))
+	entry = append(entry, inner...)
+	strct := append(appendVarint([]byte{0x0a}, uint64(len(entry))), entry...) // Struct.fields = entry
+	return append(appendVarint([]byte{0x2a}, uint64(len(strct))), strct...)   // Value.struct_value = Struct
+}
+
+// deepValueNested builds the raw Value bytes of a `levels`-deep frame
+// around string_value("deep"), one wrapper hop per level.
+func deepValueNested(t *testing.T, levels int, wrap func([]byte) []byte) []byte {
+	t.Helper()
+	value := []byte{0x1a, 0x04, 'd', 'e', 'e', 'p'} // Value.string_value = "deep"
+	for i := 0; i < levels; i++ {
+		value = wrap(value)
+	}
+	return value
+}
+
+// mapValueEntry wraps Value bytes as a map<string, bytes(Value)> entry
+// (field 1 key "arg", field 2 value) exactly like the mcp_args wire.
+func mapValueEntry(value []byte) []byte {
+	entry := append([]byte{0x0a, 0x03, 'a', 'r', 'g'}, 0x12) // field 1 = "arg"
+	entry = appendVarint(entry, uint64(len(value)))
+	return append(entry, value...) // field 2 = Value bytes
+}
+
+// deepValueFrame builds a Value nested `levels` list_value wrappers deep
+// around a string_value("deep"), then wraps it as a map<string, bytes(Value)>
+// entry exactly like the mcp_args wire.
+func deepValueFrame(t *testing.T, levels int) []byte {
+	t.Helper()
+	return mapValueEntry(deepValueFrameRaw(t, levels))
+}
+
+// deepValueFrameRaw is the raw Value bytes of a `levels`-deep list_value
+// frame (without the map-entry wrapper), for the direct decodeProtoValue door.
+func deepValueFrameRaw(t *testing.T, levels int) []byte {
+	t.Helper()
+	return deepValueNested(t, levels, nestValueList)
+}
+
+// deepStructFrame is deepValueFrame with struct_value wrapper hops, so the
+// struct door counts against the same depth budget as the list door.
+func deepStructFrame(t *testing.T, levels int) []byte {
+	t.Helper()
+	return mapValueEntry(deepValueNested(t, levels, nestValueStruct))
+}
+
+// TestProtoValueDepthBound pins the fail-closed depth bound on the
+// google.protobuf.Value shim. Before the bound, the decode trio recursed
+// once per wire level with no limit: the wire costs ~4-5 bytes per level, so
+// a single crafted frame under the connect frame cap encoded millions of
+// levels and exhausted the goroutine stack - a fatal, unrecoverable process
+// crash from one upstream frame (the in-process test asserts the CAP
+// behavior, not the crash). A frame nested past the bound must fail closed
+// (ok=false, so the mcp_args entry is dropped) and a frame within the bound
+// must still decode to the correct nested value.
+func TestProtoValueDepthBound(t *testing.T) {
+	// Within the bound: 64 levels decode to the correctly nested value.
+	if _, v, ok := decodeStringValueMapEntry(deepValueFrame(t, 64), newProtoFieldBudget()); !ok {
+		t.Fatal("a 64-level Value frame failed to decode")
+	} else {
+		for i := 0; i < 64; i++ {
+			list, isList := v.([]any)
+			if !isList || len(list) != 1 {
+				t.Fatalf("level %d unwraps to %T, want a one-element list", 64-i, v)
+			}
+			v = list[0]
+		}
+		if v != "deep" {
+			t.Fatalf("innermost value = %v, want \"deep\"", v)
+		}
+	}
+	// Past the bound: fail closed, never decode, never recurse.
+	if _, _, ok := decodeStringValueMapEntry(deepValueFrame(t, 400), newProtoFieldBudget()); ok {
+		t.Fatal("a 400-level Value frame decoded; the depth bound must fail closed")
+	}
+	if _, ok := decodeProtoValue(deepValueFrameRaw(t, 400), 0, newProtoFieldBudget()); ok {
+		t.Fatal("decodeProtoValue must reject a too-deep frame")
+	}
+	// The exact gate boundary: the deepest Value sits at depth == wrapper
+	// levels and the gate is depth > protoValueMaxDepth, so exactly 128
+	// wrapper levels decode and 129 fail closed. The pair is hardcoded so
+	// silent drift of the constant fails here instead of moving with it.
+	if protoValueMaxDepth != 128 {
+		t.Fatalf("protoValueMaxDepth = %d; the pinned gate is 128 decode / 129 fail closed", protoValueMaxDepth)
+	}
+	if _, _, ok := decodeStringValueMapEntry(deepValueFrame(t, 128), newProtoFieldBudget()); !ok {
+		t.Fatal("a 128-level Value frame failed to decode; exactly 128 must pass the gate")
+	}
+	if _, _, ok := decodeStringValueMapEntry(deepValueFrame(t, 129), newProtoFieldBudget()); ok {
+		t.Fatal("a 129-level Value frame decoded; 129 (protoValueMaxDepth+1) must fail closed")
+	}
+	// struct_value hops count against the same budget.
+	if _, _, ok := decodeStringValueMapEntry(deepStructFrame(t, 128), newProtoFieldBudget()); !ok {
+		t.Fatal("a 128-level struct frame failed to decode; struct hops share the 128 budget")
+	}
+	if _, _, ok := decodeStringValueMapEntry(deepStructFrame(t, 129), newProtoFieldBudget()); ok {
+		t.Fatal("a 129-level struct frame decoded; struct hops must fail closed at 129")
+	}
+}
+
+// TestProtoStructValueDoor covers the struct_value door (decodeProtoValue
+// case 5), which had no test coverage anywhere: one struct level around
+// string_value("deep") decodes through the mcp_args entry door to
+// map[string]any{"k": "deep"}.
+func TestProtoStructValueDoor(t *testing.T) {
+	k, v, ok := decodeStringValueMapEntry(deepStructFrame(t, 1), newProtoFieldBudget())
+	if !ok {
+		t.Fatal("a struct_value frame failed to decode")
+	}
+	if k != "arg" {
+		t.Errorf("key = %q, want \"arg\"", k)
+	}
+	m, isMap := v.(map[string]any)
+	if !isMap {
+		t.Fatalf("struct_value decoded to %T, want map[string]any", v)
+	}
+	if got := m["k"]; got != "deep" {
+		t.Errorf("struct_value[\"k\"] = %#v, want \"deep\"", got)
+	}
+}
+
+// mcpArgValueString wraps a string as google.protobuf.Value.string_value
+// (field 3), the way an mcp_args entry carries it.
+func mcpArgValueString(s string) []byte {
+	b := appendTag(nil, 3, wireBytes)
+	b = appendVarint(b, uint64(len(s)))
+	return append(b, s...)
+}
+
+// mcpArgValueBool wraps a bool as google.protobuf.Value.bool_value (field 4).
+func mcpArgValueBool(v bool) []byte {
+	b := appendTag(nil, 4, wireVarint)
+	if v {
+		return append(b, 1)
+	}
+	return append(b, 0)
+}
+
+// mcpArgsEntry builds one map<string, bytes(Value)> entry exactly like the
+// mcp_args wire: field 1 key, field 2 Value bytes. An empty key is the
+// documented hostile shape decodeMapEntry must refuse.
+func mcpArgsEntry(key string, value []byte) []byte {
+	entry := appendTag(nil, 1, wireBytes)
+	entry = appendVarint(entry, uint64(len(key)))
+	entry = append(entry, key...)
+	entry = appendTag(entry, 2, wireBytes)
+	entry = appendVarint(entry, uint64(len(value)))
+	return append(entry, value...)
+}
+
+// deepWideStructValue builds a google.protobuf.Value `levels` struct_value
+// hops deep. Every Struct level carries `siblings` map entries: the first
+// entry embeds the next level, the rest carry empty Value messages. Four
+// levels of 65,535 siblings is ~4.25 MiB of wire and ~786k decoded fields if
+// every container level restarts the field budget - the shape the flat
+// per-slice bound missed.
+func deepWideStructValue(levels, siblings int) []byte {
+	const key = "sibling-key" // 11 bytes pads the fixture to ~4.25 MiB
+	value := []byte{}         // empty Value decodes as nil
+	for level := 0; level < levels; level++ {
+		emptyEntry := appendTag(nil, 1, wireBytes)
+		emptyEntry = appendVarint(emptyEntry, uint64(len(key)))
+		emptyEntry = append(emptyEntry, key...)
+		emptyEntry = appendTag(emptyEntry, 2, wireBytes)
+		emptyEntry = appendVarint(emptyEntry, 0)
+
+		var strct []byte
+		for i := 0; i < siblings; i++ {
+			entry := emptyEntry
+			if i == 0 {
+				entry = appendTag(nil, 1, wireBytes)
+				entry = appendVarint(entry, uint64(len(key)))
+				entry = append(entry, key...)
+				entry = appendTag(entry, 2, wireBytes)
+				entry = appendVarint(entry, uint64(len(value)))
+				entry = append(entry, value...)
+			}
+			strct = appendTag(strct, 1, wireBytes) // Struct.fields
+			strct = appendVarint(strct, uint64(len(entry)))
+			strct = append(strct, entry...)
+		}
+		wrapped := appendTag(nil, 5, wireBytes) // Value.struct_value
+		wrapped = appendVarint(wrapped, uint64(len(strct)))
+		value = append(wrapped, strct...)
+	}
+	return value
+}
+
+// TestProtoNestedFieldBudget pins the frame-wide decoded-field budget. Before
+// the budget was threaded, parseProtoFieldsWire checked only its own slice, so
+// every nested map entry, Struct and ListValue parse got a fresh 65,536-field
+// allowance. A 4.25 MiB frame with four Struct levels of 65,535 siblings
+// materialized ~786k fields (~206 MB observed, scaling toward ~1.5 GiB at the
+// 32 MiB connect frame cap). Through production parseMcpArgs the whole tree
+// must now fail closed and allocate well under 48 MiB.
+func TestProtoNestedFieldBudget(t *testing.T) {
+	const levels, siblings = 4, 65_535
+	value := deepWideStructValue(levels, siblings)
+	mcp := appendString(nil, fMcpArgsName, "nested")
+	mcp = appendMessage(mcp, fMcpArgsArgs, mcpArgsEntry("deep", value))
+	if len(mcp) < 4<<20 || len(mcp) > 5<<20 {
+		t.Fatalf("fixture wire = %d bytes, want the measured ~4.25 MiB shape", len(mcp))
+	}
+
+	// The entry door fails closed rather than returning the frame as text.
+	if _, _, ok := decodeStringValueMapEntry(mcpArgsEntry("deep", value), newProtoFieldBudget()); ok {
+		t.Fatal("over-budget nested Value decoded; the shared field budget must fail closed")
+	}
+
+	call := parseMcpArgs(&protoField{wire: wireBytes, raw: mcp})
+	if call.Name != "nested" || call.Args != "" {
+		t.Fatalf("parseMcpArgs name = %q args = %q, want the over-budget entry dropped", call.Name, call.Args)
+	}
+	alloc := allocDelta(func() { parseMcpArgs(&protoField{wire: wireBytes, raw: mcp}) })
+	if alloc > 48<<20 {
+		t.Fatalf("over-budget nested frame allocated %d bytes, want a bounded <48 MiB", alloc)
+	}
+	t.Logf("nested field frame: %d wire bytes, %d bytes allocated", len(mcp), alloc)
+}
+
+// TestProtoValueFieldBudgetPropagates pins the raw-string fallback boundary: a
+// Value envelope whose own field count exhausts the budget is a hard parse
+// failure, not plain text to admit verbatim, while genuinely malformed
+// non-Value bytes keep the established raw-string fallback.
+func TestProtoValueFieldBudgetPropagates(t *testing.T) {
+	dense := bytes.Repeat([]byte{0x08, 0x00}, protoFieldCountMax+1)
+	if _, ok := decodeProtoValue(dense, 0, newProtoFieldBudget()); ok {
+		t.Fatal("over-budget Value decoded; errProtoFieldCount must not fall back to raw text")
+	}
+	if v, ok := decodeProtoValue([]byte{0x07}, 0, newProtoFieldBudget()); !ok || v != "\x07" {
+		t.Fatalf("malformed non-Value = %#v/%v, want the raw-string fallback", v, ok)
+	}
+}
+
+// TestProtoFieldBudgetPerFrame pins that the budget is per decode call, not
+// package state: two near-cap frames decoded concurrently must both keep the
+// full allowance, and the race detector must see no shared counter.
+func TestProtoFieldBudgetPerFrame(t *testing.T) {
+	frame := bytes.Repeat([]byte{0x08, 0x00}, protoFieldCountMax/2)
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = parseProtoFields(frame)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent frame %d: %v", i, err)
+		}
+	}
+}
+
+// TestParseMcpArgsSkipsHostileArgEntries pins the consumer leg of the
+// mcp_args map: parseMcpArgs must keep every good entry and silently skip
+// hostile ones (an empty-key entry decodes ok=false and is dropped), so one
+// malformed entry can neither blank the whole argument map nor smuggle an
+// empty-named key into it.
+func TestParseMcpArgsSkipsHostileArgEntries(t *testing.T) {
+	msg := appendString(nil, fMcpArgsName, "lookup")
+	msg = appendString(msg, fMcpArgsToolCallID, "call-9")
+	msg = appendMessage(msg, fMcpArgsArgs, mcpArgsEntry("file", mcpArgValueString("main.go")))
+	msg = appendMessage(msg, fMcpArgsArgs, mcpArgsEntry("dry_run", mcpArgValueBool(true)))
+	msg = appendMessage(msg, fMcpArgsArgs, mcpArgsEntry("", mcpArgValueString("hostile")))
+	outer := appendMessage(nil, 1, msg)
+	fields, err := parseProtoFields(outer)
+	if err != nil {
+		t.Fatalf("fixture mcp_args frame: %v", err)
+	}
+	if len(fields) != 1 {
+		t.Fatalf("fixture frame fields = %d, want 1", len(fields))
+	}
+	call := parseMcpArgs(&fields[0])
+	if call.Name != "lookup" || call.CallID != "call-9" {
+		t.Fatalf("name = %q callID = %q, want lookup/call-9", call.Name, call.CallID)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(call.Args), &args); err != nil {
+		t.Fatalf("Args = %q: %v", call.Args, err)
+	}
+	if len(args) != 2 || args["file"] != "main.go" || args["dry_run"] != true {
+		t.Fatalf("args = %#v, want the two good entries only (hostile entry skipped)", args)
+	}
+}
+
+// TestProtoFieldCountBudget pins the frame-wide decoded-field budget. A minimal
+// field is 2 wire bytes but one protoField is 48 bytes, so a 4 MiB dense frame
+// previously produced 2,097,152 fields and a ~528 MB allocation; a 32 MiB
+// frame extrapolated to ~4 GiB. The budget must fail closed for both parser
+// paths, keep allocation bounded independently of frame size, and still admit
+// a large legitimate tool-argument map.
+func TestProtoFieldCountBudget(t *testing.T) {
+	// Compatibility fixture: a 16,384-entry mcp_args map is far below the
+	// budget and must decode completely.
+	var mcp []byte
+	mcp = appendString(mcp, fMcpArgsName, "bulk")
+	const argCount = 16 << 10
+	for i := 0; i < argCount; i++ {
+		key := "arg-" + strconv.Itoa(i)
+		mcp = appendMessage(mcp, fMcpArgsArgs, mcpArgsEntry(key, mcpArgValueString("v")))
+	}
+	call := parseMcpArgs(&protoField{wire: wireBytes, raw: mcp})
+	var args map[string]any
+	if err := json.Unmarshal([]byte(call.Args), &args); err != nil {
+		t.Fatalf("large legitimate mcp_args map did not decode: %v", err)
+	}
+	if len(args) != argCount {
+		t.Fatalf("large legitimate map decoded %d args, want %d", len(args), argCount)
+	}
+
+	// The budget is exact: a buffer at the cap parses, one more field fails.
+	exact := bytes.Repeat([]byte{0x08, 0x00}, protoFieldCountMax)
+	fields, err := parseProtoFields(exact)
+	if err != nil {
+		t.Fatalf("a buffer at the field budget was rejected: %v", err)
+	}
+	if len(fields) != protoFieldCountMax {
+		t.Fatalf("fields at the budget = %d, want %d", len(fields), protoFieldCountMax)
+	}
+	over := append(exact, 0x08, 0x00)
+	if _, err := parseProtoFields(over); !errors.Is(err, errProtoFieldCount) {
+		t.Fatalf("one field over budget error = %v, want %v", err, errProtoFieldCount)
+	}
+
+	// A 4 MiB dense frame must fail closed with bounded allocation (the old
+	// path materialized 2,097,152 fields and ~528 MB).
+	dense := bytes.Repeat([]byte{0x08, 0x00}, 2<<20)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	fields, err = parseProtoFields(dense)
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, errProtoFieldCount) {
+		t.Fatalf("dense frame error = %v, want %v", err, errProtoFieldCount)
+	}
+	if fields != nil {
+		t.Fatalf("dense frame returned %d fields, want none", len(fields))
+	}
+	if !strings.Contains(err.Error(), strconv.Itoa(protoFieldCountMax)) {
+		t.Fatalf("dense frame error = %q, want the named limit", err)
+	}
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 48<<20 {
+		t.Fatalf("dense frame allocated %d bytes, want a bounded <48 MiB", alloc)
+	}
+	// The lenient Value-shim parser shares the same bound.
+	if _, err := parseProtoFieldsLenient(dense); !errors.Is(err, errProtoFieldCount) {
+		t.Fatalf("lenient dense frame error = %v, want %v", err, errProtoFieldCount)
+	}
+}

@@ -1,0 +1,1038 @@
+package mcp
+
+import (
+	"encoding/json"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/LLM-4-People/millivolt/internal/config"
+	"github.com/LLM-4-People/millivolt/internal/metrics"
+	"github.com/LLM-4-People/millivolt/internal/web"
+	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// TestDescribeMirrorsTheProxyOwners pins every fact this server duplicates from
+// an owner it cannot import (an unexported constant) or deliberately mirrors.
+// An importable owner is compared directly, so a change on the owning side
+// fails here. An unexported cap is pinned by a literal here and by an
+// owner-side literal in tests/_go/internal/web/published_limits.go, so a change
+// on either side fails one of the two. Each assertion names its owner.
+func TestDescribeMirrorsTheProxyOwners(t *testing.T) {
+	// Status classes: internal/web statusClass returns exactly these five,
+	// with cancel for 499 and err for everything else (3xx included). The
+	// expected list is read from the web owner, not repeated here.
+	if got, want := StatusClasses, web.StatusClasses; !reflect.DeepEqual(got, want) {
+		t.Fatalf("status classes = %v, want %v (owner: internal/web statusClass)", got, want)
+	}
+
+	// Time buckets: derive the four names from metrics.TimeBucket, the
+	// server-local daypart owner, instead of comparing the list to itself.
+	monday := time.Date(2026, 3, 2, 0, 0, 0, 0, time.Local)
+	produced := map[string]bool{}
+	for _, at := range []time.Time{
+		monday.Add(7 * time.Hour),                   // before 08:00
+		monday.Add(9 * time.Hour),                   // 08:00 to 16:00
+		monday.Add(17 * time.Hour),                  // from 16:00
+		monday.AddDate(0, 0, 5).Add(10 * time.Hour), // Saturday
+	} {
+		produced[metrics.TimeBucket(at)] = true
+	}
+	if len(produced) != len(TimeBuckets) {
+		t.Fatalf("metrics.TimeBucket produces %v, describe lists %v", produced, TimeBuckets)
+	}
+	for _, bucket := range TimeBuckets {
+		if !produced[bucket] {
+			t.Fatalf("describe lists the time bucket %q, which metrics.TimeBucket never returns", bucket)
+		}
+	}
+
+	// Error filter keys: the join order of internal/web errorKey.
+	if got, want := ErrorFilterKeys, []string{"type", "code", "message"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("error filter keys = %v, want %v (owner: internal/web errorKey)", got, want)
+	}
+
+	// Log page band: internal/config MCPPageSizeMin/Max owns the band and
+	// describe.go defines logPageMin/logPageMax from that owner. Comparing the
+	// mirror to the owner is a self-comparison (both sides resolve to the same
+	// constant) and can never fail, and it still passes when the derivation is
+	// replaced by a same-value literal, so the derivation is checked at its
+	// definition site instead. The hand-written RecordsInput.Limit schema text
+	// below is the independent published pin: it must state the owner's band,
+	// so an owner edit forces the prose to follow.
+	assertLogPageBandDerivesFromConfig(t)
+
+	// The records limit argument states the same band in prose. Deriving the
+	// expected phrase from the config owner and comparing the parsed band
+	// exactly means a widened or tidied tag cannot keep the old numbers.
+	limitField, ok := reflect.TypeOf(RecordsInput{}).FieldByName("Limit")
+	if !ok {
+		t.Fatal("RecordsInput has no Limit field")
+	}
+	wantLimit := fmt.Sprintf("page size, %d to %d", config.MCPPageSizeMin, config.MCPPageSizeMax)
+	limitTag := string(limitField.Tag.Get("jsonschema"))
+	if got := regexp.MustCompile(`page size, [0-9]+ to [0-9]+`).FindString(limitTag); got != wantLimit {
+		t.Fatalf("RecordsInput.Limit schema states %q, want %q (owner: internal/config MCPPageSizeMin/Max): %q",
+			got, wantLimit, limitTag)
+	}
+
+	// Explorer group cap: internal/web xpNodeCap.
+	if explorerMaxGroups != 24 {
+		t.Fatalf("explorer group cap = %d, want 24 (owner: internal/web xpNodeCap)", explorerMaxGroups)
+	}
+	// Chart bucket cap: the proxy's payload maximum is internal/web
+	// chartMaxBuckets+1 (the clock-aligned start can add one partial bucket).
+	// The owner itself is pinned by TestChartBucketCapMatchesThePublishedReference
+	// in tests/_go/internal/web/published_limits.go, so this literal catches a
+	// mirror edit and that test catches an owner edit.
+	if chartMaxBuckets != 31 {
+		t.Fatalf("chart bucket cap = %d, want 31 (owner: internal/web chartMaxBuckets+1)", chartMaxBuckets)
+	}
+
+	// Operator token band: OperatorTokenMinLen/MaxLen in this package are the
+	// single owner; cmd/proxy's boot gate reads them.
+	// TestOperatorGateUsesThePublishedTokenContract in tests/_go/cmd/proxy
+	// derives its boundary tokens from the same constants, refuses a
+	// one-byte-over-max Bearer and parses cmd/proxy/operator.go with
+	// go/parser: it follows same-package callees and requires the assigned
+	// result of os.LookupEnv(mcp.ProxyTokenEnv) to be compared against the
+	// owner band inside a decision condition (an if condition or a switch
+	// case), so a live-site literal, a discarded lookup or a discarded
+	// comparison fails even when the value matches today. The guard does not
+	// follow a lookup whose result leaves through a return value, a field or
+	// a different package, and it reaches only the callee graph of those two
+	// roots; this literal pin catches an owner edit.
+	if OperatorTokenMinLen != 16 || OperatorTokenMaxLen != 512 {
+		t.Fatalf("token band = %d..%d, want 16..512 (owner: internal/mcp OperatorTokenMinLen/MaxLen)",
+			OperatorTokenMinLen, OperatorTokenMaxLen)
+	}
+}
+
+// assertLogPageBandDerivesFromConfig parses describe.go and requires the log
+// page band constants to be defined from the internal/config owner selectors.
+// Value assertions cannot tell a derived constant from a same-value literal, so
+// the definition site is the only place the derivation can be pinned; a
+// missing, renamed or literal definition fails here, and formatting does not
+// matter because the file is parsed, not scanned.
+func assertLogPageBandDerivesFromConfig(t *testing.T) {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), "describe.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse internal/mcp/describe.go: %v", err)
+	}
+	definedFrom := map[string]string{}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok || len(value.Names) != len(value.Values) {
+				continue
+			}
+			for i, name := range value.Names {
+				if name.Name != "logPageMin" && name.Name != "logPageMax" {
+					continue
+				}
+				selector, ok := value.Values[i].(*ast.SelectorExpr)
+				if !ok {
+					continue
+				}
+				if pkg, ok := selector.X.(*ast.Ident); ok && pkg.Name == "config" {
+					definedFrom[name.Name] = selector.Sel.Name
+				}
+			}
+		}
+	}
+	for _, want := range []struct{ constant, owner string }{
+		{"logPageMin", "MCPPageSizeMin"},
+		{"logPageMax", "MCPPageSizeMax"},
+	} {
+		if definedFrom[want.constant] != want.owner {
+			t.Fatalf("describe.go's %s must be defined from internal/config %s, not a same-value literal (found %q)",
+				want.constant, want.owner, definedFrom[want.constant])
+		}
+	}
+}
+
+// TestPagingToolsNameTheirRealCursorArguments pins both paging tools to the
+// argument names the model actually sends. The records description told the
+// model to page with next_before_ms/next_before_id, which are the OUTPUT
+// fields; a model that followed it named arguments the strict input decode
+// refuses. The output schema's own doc had the same confusion ("pass both next
+// cursor fields"), which names no argument at all.
+func TestPagingToolsNameTheirRealCursorArguments(t *testing.T) {
+	session := connect(t, newTestService(t, newFakeProxy(t), Limits{}))
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, tool := range listed.Tools {
+		switch tool.Name {
+		case "records", "audit_captures_list":
+			seen[tool.Name] = true
+			if !strings.Contains(tool.Description, "before_ms/before_id cursor") {
+				t.Fatalf("the %s description must name the cursor arguments it accepts: %q", tool.Name, tool.Description)
+			}
+			if strings.Contains(tool.Description, "next_before_ms/next_before_id cursor") {
+				t.Fatalf("the %s description names the output fields as the cursor to send: %q", tool.Name, tool.Description)
+			}
+		}
+	}
+	for _, name := range []string{"records", "audit_captures_list"} {
+		if !seen[name] {
+			t.Fatalf("the %s tool was not inspected; removing it from the loop must not skip the cursor-name check", name)
+		}
+	}
+	for _, typ := range []reflect.Type{reflect.TypeOf(RecordsOutput{}), reflect.TypeOf(AuditCapturesListOutput{})} {
+		for _, name := range []string{"NextBeforeMs", "NextBeforeID"} {
+			field, ok := typ.FieldByName(name)
+			if !ok {
+				t.Fatalf("%s has no %s field", typ, name)
+			}
+			if tag := string(field.Tag.Get("jsonschema")); !strings.Contains(tag, "into before_ms and before_id") {
+				t.Fatalf("%s.%s must name the arguments the pair is copied into, got %q", typ, name, tag)
+			}
+		}
+	}
+
+	// The continuation advice each listing emits must name the pair the tool
+	// RETURNS. audit_captures_list used to tell the model to page with "the
+	// before_ms and before_id pair this tool returned": those are the
+	// arguments, and no output field is ever named that.
+	proxy := newFakeProxy(t)
+	proxy.json(http.MethodGet, bootstrapPath, minimalBootstrap)
+	rows := make([]string, 0, 12)
+	for i := range 12 {
+		rows = append(rows, `{"id":"r`+strconv.Itoa(i)+`","started_at":`+strconv.Itoa(100-i)+`}`)
+	}
+	proxy.json(http.MethodGet, logPath,
+		`{"records":[`+strings.Join(rows, ",")+`],"more":true,"cursor_ms":1,"cursor_id":"rl"}`)
+	proxy.json(http.MethodGet, schemaPath, `[`+strings.Join(rows, ",")+`]`)
+	limits := defaultTestLimits()
+	limits.PageSize = 10
+	service := newTestService(t, proxy, limits)
+	page, err := service.records(t.Context(), RecordsInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	captures, err := service.auditCapturesList(t.Context(), AuditCapturesListInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		tool   string
+		marker string
+	}{
+		{"records", page.Truncation.Marker},
+		{"audit_captures_list", captures.Truncation.Marker},
+	} {
+		if !strings.Contains(tc.marker, "next_before_ms") || !strings.Contains(tc.marker, "next_before_id") {
+			t.Fatalf("%s advice %q must name the returned next_before_ms/next_before_id pair", tc.tool, tc.marker)
+		}
+		if strings.Contains(tc.marker, "before_ms and before_id pair this tool returned") {
+			t.Fatalf("%s advice %q names the cursor arguments as output fields", tc.tool, tc.marker)
+		}
+	}
+}
+
+// TestSnapshotCapNamesBothStorageBranches pins the formula to
+// web.BootRingCapMul and pins the storage-off branch that the old text
+// omitted. cmd/proxy applies the cap only when a store backs the ring and sets
+// the limit to 0 otherwise, so the static text must state both outcomes.
+func TestSnapshotCapNamesBothStorageBranches(t *testing.T) {
+	formula := strconv.Itoa(web.BootRingCapMul) + " * dash_log_rows"
+	assertBranches := func(surface, text string) {
+		t.Helper()
+		for _, needle := range []string{formula, "storage off", "not capped"} {
+			if !strings.Contains(text, needle) {
+				t.Fatalf("%s must state %q: %q", surface, needle, text)
+			}
+		}
+	}
+
+	// The guide's hand-written snapshot row is a duplicated reference fact:
+	// extract its formula and compare it with the owner, so a doc-only edit to
+	// a different multiplier fails here.
+	guide, err := os.ReadFile(filepath.Join("..", "..", "docs", "mcp.md"))
+	if err != nil {
+		t.Fatalf("read the MCP guide: %v", err)
+	}
+	row := regexp.MustCompile(`(?m)^\| ` + "`snapshot`" + ` \| (.+) \|$`).FindStringSubmatch(string(guide))
+	if row == nil {
+		t.Fatal("docs/mcp.md must keep the snapshot tool row")
+	}
+	rowFormula := regexp.MustCompile("capped at `([0-9]+) \\* dash_log_rows`").FindStringSubmatch(row[1])
+	if rowFormula == nil {
+		t.Fatalf("the docs/mcp.md snapshot row must state the cap formula: %q", row[1])
+	}
+	if rowFormula[1] != strconv.Itoa(web.BootRingCapMul) {
+		t.Fatalf("the docs/mcp.md snapshot row states %s * dash_log_rows, the owner is %d (internal/web BootRingCapMul)",
+			rowFormula[1], web.BootRingCapMul)
+	}
+	assertBranches("the guide row", row[1])
+
+	proxy := newFakeProxy(t)
+	proxy.json(http.MethodGet, bootstrapPath, minimalBootstrap)
+	proxy.json(http.MethodGet, debugPath, emptyDebugStatus)
+	proxy.json(http.MethodGet, schemaPath, `[]`)
+	reference, err := newTestService(t, proxy, Limits{}).describe(t.Context(), DescribeInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBranches("the describe note", strings.Join(reference.Notes, " "))
+
+	session := connect(t, newTestService(t, newFakeProxy(t), Limits{}))
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range listed.Tools {
+		if tool.Name != "snapshot" {
+			continue
+		}
+		assertBranches("the snapshot description", tool.Description)
+		return
+	}
+	t.Fatal("the snapshot tool is not registered")
+}
+
+// TestAuditGuideRequiresDurableStorage pins the storage-off capture contract:
+// the proxy answers 503 and creates no session. The old guide and describe note
+// claimed the session started and stored nothing, which contradicted the proxy
+// and the operations guide.
+func TestAuditGuideRequiresDurableStorage(t *testing.T) {
+	assertContract := func(surface, text string) {
+		t.Helper()
+		normalized := strings.Join(strings.Fields(text), " ")
+		for _, needle := range []string{
+			"503 `durable storage is disabled`",
+			"creates no session",
+			"read-back is a 404",
+		} {
+			if !strings.Contains(normalized, needle) {
+				t.Errorf("%s must state %q: %q", surface, needle, normalized)
+			}
+		}
+		for _, stale := range []string{
+			"accepts a session",
+			"reports success, and stores nothing",
+			"sessions start",
+			"nothing is ever stored",
+		} {
+			if strings.Contains(normalized, stale) {
+				t.Errorf("%s still claims %q; the proxy returns 503 and creates no session", surface, stale)
+			}
+		}
+	}
+
+	guide, err := os.ReadFile(filepath.Join("..", "..", "docs", "mcp.md"))
+	if err != nil {
+		t.Fatalf("read the MCP guide: %v", err)
+	}
+	assertContract("docs/mcp.md", string(guide))
+
+	proxy := newFakeProxy(t)
+	proxy.json(http.MethodGet, bootstrapPath, minimalBootstrap)
+	proxy.json(http.MethodGet, debugPath, emptyDebugStatus)
+	proxy.json(http.MethodGet, schemaPath, `[]`)
+	reference, err := newTestService(t, proxy, Limits{}).describe(t.Context(), DescribeInput{})
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	note := ""
+	for _, table := range reference.Tables {
+		if table.Table == "request_debug" {
+			note = strings.Join(table.Notes, " ")
+			break
+		}
+	}
+	if note == "" {
+		t.Fatal("describe must document the request_debug table and its storage contract")
+	}
+	assertContract("the describe request_debug note", note)
+}
+
+// TestPurgePhraseHasOneOwner pins the confirmation phrase to PurgeConfirmation:
+// the input schema must carry it, the tool description must state the published
+// sentence literally, and the guide must quote the same literal. The
+// description is built from the constant, so comparing it to the constant alone
+// could never fail on a rename; its assertion anchors to the published
+// sentence instead.
+func TestPurgePhraseHasOneOwner(t *testing.T) {
+	field, ok := reflect.TypeOf(PurgeInput{}).FieldByName("Confirmation")
+	if !ok {
+		t.Fatal("PurgeInput has no Confirmation field")
+	}
+	tag := string(field.Tag.Get("jsonschema"))
+	if !strings.Contains(tag, PurgeConfirmation) {
+		t.Fatalf("the confirmation schema tag must carry the owner phrase, got %q", tag)
+	}
+	// The tool description is what the model reads before calling purge, so the
+	// phrase it must echo has to appear there too, not only in the schema.
+	session := connect(t, newTestService(t, newFakeProxy(t), Limits{}))
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered := false
+	for _, tool := range listed.Tools {
+		if tool.Name != "purge" {
+			continue
+		}
+		registered = true
+		const expectedSentence = "confirmation must be the exact phrase 'permanently delete the matching millivolt history'"
+		if !strings.Contains(tool.Description, expectedSentence) {
+			t.Fatalf("the purge tool description must state %q, got %q", expectedSentence, tool.Description)
+		}
+	}
+	if !registered {
+		t.Fatal("the purge tool is not registered")
+	}
+	path := filepath.Join("..", "..", "docs", "mcp.md")
+	guide, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read the MCP guide: %v", err)
+	}
+	if !strings.Contains(string(guide), PurgeConfirmation) {
+		t.Fatalf("docs/mcp.md must quote the exact confirmation phrase %q", PurgeConfirmation)
+	}
+}
+
+// TestAuditPhrasesHaveOneOwner pins the audit confirmation phrases to
+// auditConfirmStart and auditConfirmStopAll: the published input schema, the
+// tool description and the guide must quote the same literal the runtime
+// comparison uses. The schema tag, the description and the guide prose were
+// hand-written copies, so renaming a constant used to change only the guard
+// the handler applies while the model kept reading the old phrase.
+func TestAuditPhrasesHaveOneOwner(t *testing.T) {
+	session := connect(t, newTestService(t, newFakeProxy(t), Limits{}))
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, tool := range listed.Tools {
+		if tool.Name != "audit_start" && tool.Name != "audit_stop" {
+			continue
+		}
+		seen[tool.Name] = true
+		want := auditConfirmStart
+		if tool.Name == "audit_stop" {
+			want = auditConfirmStopAll
+		}
+		// The input schema is what the model reads when composing arguments,
+		// so the literal it must echo has to be the owner phrase there.
+		schema, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshal the %s input schema: %v", tool.Name, err)
+		}
+		if !strings.Contains(string(schema), want) {
+			t.Fatalf("the %s input schema must carry the owner phrase %q: %s", tool.Name, want, schema)
+		}
+		if !strings.Contains(tool.Description, want) {
+			t.Fatalf("the %s description must carry the owner phrase %q: %q", tool.Name, want, tool.Description)
+		}
+	}
+	for _, name := range []string{"audit_start", "audit_stop"} {
+		if !seen[name] {
+			t.Fatalf("the %s tool was not inspected; removing it from the loop must not skip the phrase check", name)
+		}
+	}
+	// The guide states the phrases in argument form, which is what an operator
+	// copies into a client configuration. Every occurrence is checked, not just
+	// the first: the start phrase appears in the tools table and again in the
+	// capture walkthrough, so editing either one alone must fail. The counts
+	// are the two places the guide documents the start phrase and the one place
+	// it documents the stop phrase; a new occurrence must extend this guard
+	// rather than slip past it.
+	guide, err := os.ReadFile(filepath.Join("..", "..", "docs", "mcp.md"))
+	if err != nil {
+		t.Fatalf("read the MCP guide: %v", err)
+	}
+	for _, expected := range []struct {
+		argument    string
+		phrase      string
+		occurrences int
+	}{
+		{"confirm", auditConfirmStart, 2},
+		{"stop_all", auditConfirmStopAll, 1},
+	} {
+		pattern := regexp.MustCompile(regexp.QuoteMeta(expected.argument) + `: "([^"]*)"`)
+		matches := pattern.FindAllStringSubmatch(string(guide), -1)
+		if len(matches) != expected.occurrences {
+			t.Fatalf("docs/mcp.md quotes %s: %d times, want %d (the audit confirmation owner)",
+				expected.argument, len(matches), expected.occurrences)
+		}
+		for _, match := range matches {
+			if match[1] != expected.phrase {
+				t.Fatalf("docs/mcp.md quotes %s: %q, the owner phrase is %q (the audit confirmation owner)",
+					expected.argument, match[1], expected.phrase)
+			}
+		}
+	}
+}
+
+// TestScopeSchemaStatesTheOwnerBounds pins the published Scope.status schema
+// text to the constants that own it. The jsonschema tag is a hand copy of
+// statusCodeMin/Max and LiveStatusClasses, so before this guard a tag edit to
+// 0..10000 or an extra class changed what the model reads while the runtime
+// validation (which reads the owners) stayed correct. The guard parses every
+// tool schema that embeds Scope and compares the description with the owner
+// text; the runtime checks below pin Validate to the same owners, so the
+// schema cannot be widened into accepting anything the owners refuse.
+func TestScopeSchemaStatesTheOwnerBounds(t *testing.T) {
+	want := fmt.Sprintf("exact HTTP status code %d..%d, or a live class: %s",
+		statusCodeMin, statusCodeMax, strings.Join(LiveStatusClasses, ", "))
+
+	session := connect(t, newTestService(t, newFakeProxy(t), Limits{}))
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The explorer, chart and records inputs all embed Scope; the SDK promotes
+	// its tagged fields, so each publishes the same status property.
+	checked := map[string]bool{}
+	for _, tool := range listed.Tools {
+		switch tool.Name {
+		case "explore", "chart", "records":
+		default:
+			continue
+		}
+		encoded, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshal the %s input schema: %v", tool.Name, err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(encoded, &schema); err != nil {
+			t.Fatalf("parse the %s input schema: %v", tool.Name, err)
+		}
+		property, ok := schema.Properties["status"]
+		if !ok {
+			t.Fatalf("the %s input schema publishes no status property", tool.Name)
+		}
+		if property.Description != want {
+			t.Fatalf("the %s status schema states %q, the owners state %q (statusCodeMin/Max, LiveStatusClasses)",
+				tool.Name, property.Description, want)
+		}
+		checked[tool.Name] = true
+	}
+	for _, name := range []string{"explore", "chart", "records"} {
+		if !checked[name] {
+			t.Fatalf("the %s tool was not inspected; removing it from the loop must not skip the schema check", name)
+		}
+	}
+
+	// Runtime validation reads the owners directly and must not follow a
+	// widened tag: every class passes, both band ends pass, and the first code
+	// beyond the band and an unknown class are refused.
+	for _, class := range LiveStatusClasses {
+		if err := (Scope{Status: class}).Validate(); err != nil {
+			t.Fatalf("Validate(%q) = %v, want nil (LiveStatusClasses owner)", class, err)
+		}
+	}
+	for _, code := range []int{statusCodeMin, statusCodeMax} {
+		if err := (Scope{Status: strconv.Itoa(code)}).Validate(); err != nil {
+			t.Fatalf("Validate(%d) = %v, want nil (statusCodeMin/Max owner)", code, err)
+		}
+	}
+	if err := (Scope{Status: strconv.Itoa(statusCodeMax + 1)}).Validate(); err == nil {
+		t.Fatalf("Validate(%d) must refuse a code beyond statusCodeMax", statusCodeMax+1)
+	}
+	if err := (Scope{Status: "not-a-class"}).Validate(); err == nil {
+		t.Fatal("Validate must refuse a status that is neither a class nor a code")
+	}
+}
+
+// TestExploreErrorTotalSchemaDistinguishesTheErrorDimension pins the published
+// error_total description to the two units the proxy actually returns. The
+// error dimension's total is the union of affected requests represented by its
+// cards, which includes recovered quality failures whose final status is 200;
+// every other dimension reports the canonical error count. One generic
+// "requests that are errors" sentence erased that distinction from the model.
+func TestExploreErrorTotalSchemaDistinguishesTheErrorDimension(t *testing.T) {
+	session := connect(t, newTestService(t, newFakeProxy(t), Limits{}))
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range listed.Tools {
+		if tool.Name != "explore" {
+			continue
+		}
+		encoded, err := json.Marshal(tool.OutputSchema)
+		if err != nil {
+			t.Fatalf("marshal the explore output schema: %v", err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(encoded, &schema); err != nil {
+			t.Fatalf("parse the explore output schema: %v", err)
+		}
+		property, ok := schema.Properties["error_total"]
+		if !ok {
+			t.Fatalf("the explore output schema publishes no error_total property: %s", encoded)
+		}
+		description := strings.Join(strings.Fields(property.Description), " ")
+		for _, needle := range []string{
+			"for the error dimension",
+			"distinct affected requests",
+			"error-card union",
+			"recovered final-200",
+			"for every other dimension",
+			"canonical error",
+		} {
+			if !strings.Contains(description, needle) {
+				t.Fatalf("the explore error_total schema must state %q: %q", needle, description)
+			}
+		}
+		return
+	}
+	t.Fatal("the explore tool is not registered")
+}
+
+// TestProtocolVersionsMirrorTheSDK pins the accepted protocol versions listed
+// in docs/mcp.md to the bundled SDK's own list, which is the owner of that set.
+// The guide's hand list used to be unguarded, so a dependency upgrade or a doc
+// edit could silently change what the endpoint accepts or claims to accept.
+func TestProtocolVersionsMirrorTheSDK(t *testing.T) {
+	guide, err := os.ReadFile(filepath.Join("..", "..", "docs", "mcp.md"))
+	if err != nil {
+		t.Fatalf("read the MCP guide: %v", err)
+	}
+	const heading = "The accepted protocol versions are the bundled SDK's full set, newest first:"
+	index := strings.Index(string(guide), heading)
+	if index < 0 {
+		t.Fatalf("docs/mcp.md must state %q", heading)
+	}
+	// The list is the sentence right after the heading; the next sentence
+	// repeats some versions in prose, so the scan stops at the first period.
+	sentence := string(guide)[index+len(heading):]
+	if dot := strings.Index(sentence, "."); dot >= 0 {
+		sentence = sentence[:dot]
+	}
+	matches := regexp.MustCompile("`([0-9]{4}-[0-9]{2}-[0-9]{2})`").FindAllStringSubmatch(sentence, -1)
+	listed := make([]string, 0, len(matches))
+	for _, match := range matches {
+		listed = append(listed, match[1])
+	}
+	if want := sdk.SupportedProtocolVersions(); !reflect.DeepEqual(listed, want) {
+		t.Fatalf("docs/mcp.md lists %v, the SDK supports %v (owner: github.com/modelcontextprotocol/go-sdk/mcp SupportedProtocolVersions)", listed, want)
+	}
+}
+
+// TestToolTableMatchesTheRegistry pins the hand-written tools table in
+// docs/mcp.md to the registered surface: a renamed, missing or extra row fails
+// here, so the published list cannot drift from the tools the server serves.
+// The comparison is bidirectional: a registered tool with no row is as wrong
+// as a row naming a tool the registry does not serve.
+func TestToolTableMatchesTheRegistry(t *testing.T) {
+	guide, err := os.ReadFile(filepath.Join("..", "..", "docs", "mcp.md"))
+	if err != nil {
+		t.Fatalf("read the MCP guide: %v", err)
+	}
+	const heading = "## Tools"
+	index := strings.Index(string(guide), heading)
+	if index < 0 {
+		t.Fatalf("docs/mcp.md must keep the %q section that lists every tool", heading)
+	}
+	// A tool row starts with its backticked name in the first cell; the header
+	// and separator rows do not match.
+	row := regexp.MustCompile("^\\| `([a-z][a-z0-9_]*)` \\|")
+	seen := map[string]int{}
+	rows := 0
+	started := false
+	for _, line := range strings.Split(string(guide)[index+len(heading):], "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "|") {
+			started = true
+			if match := row.FindStringSubmatch(trimmed); match != nil {
+				seen[match[1]]++
+				rows++
+			}
+			continue
+		}
+		if started && trimmed != "" {
+			break
+		}
+	}
+	if rows == 0 {
+		t.Fatal("docs/mcp.md's tools table has no rows naming a tool")
+	}
+	session := connect(t, newTestService(t, newFakeProxy(t), Limits{}))
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, count := range seen {
+		if count > 1 {
+			t.Fatalf("the tools table lists %s %d times", name, count)
+		}
+		registered := false
+		for _, tool := range listed.Tools {
+			if tool.Name == name {
+				registered = true
+				break
+			}
+		}
+		if !registered {
+			t.Fatalf("the tools table lists %s, which the registry does not serve", name)
+		}
+	}
+	for _, tool := range listed.Tools {
+		if seen[tool.Name] == 0 {
+			t.Fatalf("the tools table omits %s, which the registry serves", tool.Name)
+		}
+	}
+}
+
+// guideToolNames returns the backticked tool names of the guide sentence that
+// follows heading, up to that sentence's first period. The guide has one
+// enumerated sentence per annotation class, so the heading plus the regex are
+// its whole contract.
+func guideToolNames(t *testing.T, guide, heading string) map[string]bool {
+	t.Helper()
+	index := strings.Index(guide, heading)
+	if index < 0 {
+		t.Fatalf("docs/mcp.md must state %q", heading)
+	}
+	sentence := guide[index+len(heading):]
+	if dot := strings.Index(sentence, "."); dot >= 0 {
+		sentence = sentence[:dot]
+	}
+	listed := map[string]bool{}
+	for _, match := range regexp.MustCompile("`([a-z][a-z0-9_]*)`").FindAllStringSubmatch(sentence, -1) {
+		if listed[match[1]] {
+			t.Fatalf("the %q list names %s twice", heading, match[1])
+		}
+		listed[match[1]] = true
+	}
+	if len(listed) == 0 {
+		t.Fatalf("the %q sentence names no tool", heading)
+	}
+	return listed
+}
+
+// annotatedTools splits the registered surface by the registry's own
+// annotations: a non-nil DestructiveHint is the mutating-or-destructive set
+// (readOnly sets only ReadOnlyHint), and ReadOnlyHint true is the read-only
+// set. Every registered tool must land in exactly one of the two sets.
+func annotatedTools(t *testing.T) (readOnly, stateChanging map[string]bool) {
+	t.Helper()
+	session := connect(t, newTestService(t, newFakeProxy(t), Limits{}))
+	registered, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readOnly = map[string]bool{}
+	stateChanging = map[string]bool{}
+	for _, tool := range registered.Tools {
+		if tool.Annotations == nil {
+			continue
+		}
+		switch {
+		case tool.Annotations.DestructiveHint != nil:
+			stateChanging[tool.Name] = true
+		case tool.Annotations.ReadOnlyHint:
+			readOnly[tool.Name] = true
+		}
+	}
+	if got := len(readOnly) + len(stateChanging); got != len(registered.Tools) {
+		t.Fatalf("the registry annotates %d of %d tools as read-only or state-changing", got, len(registered.Tools))
+	}
+	return readOnly, stateChanging
+}
+
+// assertGuideSet compares the guide's enumerated set for one annotation class
+// with the registry-derived set in both directions, so a rename, a move
+// between classes, or an unlisted addition fails here.
+func assertGuideSet(t *testing.T, category string, guide, registry map[string]bool) {
+	t.Helper()
+	for name := range registry {
+		if !guide[name] {
+			t.Fatalf("the guide's %s list omits %s, which the registry annotates %s", category, name, category)
+		}
+	}
+	for name := range guide {
+		if !registry[name] {
+			t.Fatalf("the guide lists %s as %s, the registry annotates it differently", name, category)
+		}
+	}
+}
+
+// TestStateChangingToolsMatchTheRegistry pins the guide's state-changing tool
+// list to the registry annotations, the one owner of that classification: a
+// tool the registry annotates mutating or destructive is state-changing, a
+// read-only annotated tool is not. The guarded sentence is the one with
+// "state-changing tools are " and ending at its first period.
+func TestStateChangingToolsMatchTheRegistry(t *testing.T) {
+	guide, err := os.ReadFile(filepath.Join("..", "..", "docs", "mcp.md"))
+	if err != nil {
+		t.Fatalf("read the MCP guide: %v", err)
+	}
+	_, stateChanging := annotatedTools(t)
+	assertGuideSet(t, "state-changing", guideToolNames(t, string(guide), "state-changing tools are "), stateChanging)
+}
+
+// TestReadOnlyToolsMatchTheRegistry pins the guide's read-only tool list the
+// same way, against the same registry owner: a read-only annotated tool is
+// read-only, a mutating or destructive one is not. The list enumerated here
+// used to name only some of the read-only tools, and a mutation of an unlisted
+// name changed no behavior any test observed.
+func TestReadOnlyToolsMatchTheRegistry(t *testing.T) {
+	guide, err := os.ReadFile(filepath.Join("..", "..", "docs", "mcp.md"))
+	if err != nil {
+		t.Fatalf("read the MCP guide: %v", err)
+	}
+	readOnly, _ := annotatedTools(t)
+	assertGuideSet(t, "read-only", guideToolNames(t, string(guide), "read-only tools are"), readOnly)
+}
+
+// TestDocumentedToolCountMatchesTheRegistry pins every hand-written "N tools"
+// claim in the published docs to the registered tool surface, which is the
+// owner: adding or removing a tool must update each mention, and a doc-only
+// number edit fails here. The guarded forms are the hyphenated adjective in
+// README.md ("22-tool") and the separated forms with at most one qualifier
+// word ("22 tools", "22 MCP tools", "22 registered tools"), and every file
+// that states a count must keep stating one. The docs keep the number rather
+// than a count-free phrase because the placements read better with it; this
+// guard is what keeps it true.
+func TestDocumentedToolCountMatchesTheRegistry(t *testing.T) {
+	session := connect(t, newTestService(t, newFakeProxy(t), Limits{}))
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strconv.Itoa(len(listed.Tools))
+	// The optional qualifier word covers the separated forms ("22 MCP tools",
+	// "22 registered tools") that the plain `\s+tools?` alternative missed.
+	mentions := regexp.MustCompile(`([0-9]+)(?:-tools?|[ \t]+(?:[A-Za-z]+[ \t]+)?tools?)\b`)
+	for _, doc := range []struct{ label, path string }{
+		{"README.md", filepath.Join("..", "..", "README.md")},
+		{"docs/mcp.md", filepath.Join("..", "..", "docs", "mcp.md")},
+		{"docs/operations.md", filepath.Join("..", "..", "docs", "operations.md")},
+	} {
+		guide, err := os.ReadFile(doc.path)
+		if err != nil {
+			t.Fatalf("read %s: %v", doc.path, err)
+		}
+		found := mentions.FindAllStringSubmatch(string(guide), -1)
+		if len(found) == 0 {
+			t.Fatalf("%s no longer states how many tools are served", doc.label)
+		}
+		for _, match := range found {
+			if match[1] != want {
+				t.Fatalf("%s states %q, the registry serves %s tools", doc.label, match[0], want)
+			}
+		}
+	}
+}
+
+// TestGuidePinsTheLimitAndRedactionOwners pins the hand-written numbers in
+// docs/mcp.md to the constants that own them: the token band, the status code
+// band, the cancel status code, the explorer and chart caps, the credential
+// fragment floor, the nesting bound and the excerpt bound with its truncation
+// marker. The operator boot band also repeats in docs/operations.md's
+// operator-access prose, so that copy is pinned here too. Each expected phrase
+// is derived from the owner, so an owner edit fails here until the prose
+// follows, and a prose edit fails too. The owners' own cross-checks live in
+// TestDescribeMirrorsTheProxyOwners, the web package's
+// TestStatusClassAndBuckets (the classifier-side literal pin, now on the
+// internal/metrics StatusClientClosedRequest owner) and the client tests; this
+// guard covers the hand-written numbers in the guides' prose.
+func TestGuidePinsTheLimitAndRedactionOwners(t *testing.T) {
+	guide, err := os.ReadFile(filepath.Join("..", "..", "docs", "mcp.md"))
+	if err != nil {
+		t.Fatalf("read the MCP guide: %v", err)
+	}
+	text := string(guide)
+
+	// Operator token band: internal/mcp/limits.go OperatorTokenMinLen/MaxLen.
+	band := regexp.MustCompile(`band matches the proxy's own boot check \((\d+) to (\d+)\s+characters\)`).FindStringSubmatch(text)
+	if band == nil {
+		t.Fatal("docs/mcp.md must state the token band sentence")
+	}
+	if band[1] != strconv.Itoa(OperatorTokenMinLen) || band[2] != strconv.Itoa(OperatorTokenMaxLen) {
+		t.Fatalf("docs/mcp.md states the token band %s to %s, the owner is %d to %d",
+			band[1], band[2], OperatorTokenMinLen, OperatorTokenMaxLen)
+	}
+
+	// The operator-access section of docs/operations.md repeats the same boot
+	// band by hand; the sentence wraps across a line, so the derived phrase
+	// spans whitespace. It is pinned to the same owner as the guide sentence
+	// above.
+	operations, err := os.ReadFile(filepath.Join("..", "..", "docs", "operations.md"))
+	if err != nil {
+		t.Fatalf("read the operations guide: %v", err)
+	}
+	operationsBand := regexp.MustCompile(`shorter than (\d+)\s+or longer than (\d+) characters fails the boot`).FindStringSubmatch(string(operations))
+	if operationsBand == nil {
+		t.Fatal("docs/operations.md must state the operator boot token band")
+	}
+	if operationsBand[1] != strconv.Itoa(OperatorTokenMinLen) || operationsBand[2] != strconv.Itoa(OperatorTokenMaxLen) {
+		t.Fatalf("docs/operations.md states the boot token band %s to %s, the owner is %d to %d",
+			operationsBand[1], operationsBand[2], OperatorTokenMinLen, OperatorTokenMaxLen)
+	}
+
+	// Status code band: internal/mcp/scope.go statusCodeMin/Max, the s=
+	// selector's exact-code bound. The guide wraps the code list across the
+	// sentence, so the derived phrase spans both backticked numbers.
+	statusBand := regexp.MustCompile("exact HTTP status code \\(`([0-9]+)` to `([0-9]+)`\\)").FindStringSubmatch(text)
+	if statusBand == nil {
+		t.Fatal("docs/mcp.md must state the exact HTTP status code band")
+	}
+	if statusBand[1] != strconv.Itoa(statusCodeMin) || statusBand[2] != strconv.Itoa(statusCodeMax) {
+		t.Fatalf("docs/mcp.md states the status code band %s to %s, the owner is %d to %d (internal/mcp scope.go statusCodeMin/Max)",
+			statusBand[1], statusBand[2], statusCodeMin, statusCodeMax)
+	}
+
+	// Cancel status code: internal/metrics StatusClientClosedRequest, the one
+	// canonical owner of 499 (the web classifier reads the same constant).
+	cancel := regexp.MustCompile("`cancel` \\(([0-9]+)\\)").FindStringSubmatch(text)
+	if cancel == nil {
+		t.Fatal("docs/mcp.md must state the cancel status class with its code")
+	}
+	if cancel[1] != strconv.Itoa(metrics.StatusClientClosedRequest) {
+		t.Fatalf("docs/mcp.md states the cancel code %s, the owner is %d (internal/metrics StatusClientClosedRequest)",
+			cancel[1], metrics.StatusClientClosedRequest)
+	}
+
+	// Explorer and chart caps: internal/mcp/describe.go explorerMaxGroups and
+	// chartMaxBuckets.
+	for _, phrase := range []string{
+		fmt.Sprintf("with at most %d groups", explorerMaxGroups),
+		fmt.Sprintf("at most %d clock-aligned buckets", chartMaxBuckets),
+	} {
+		if !strings.Contains(text, phrase) {
+			t.Fatalf("docs/mcp.md must state %q (the tools table row cap)", phrase)
+		}
+	}
+	caps := regexp.MustCompile(`caps groups at (\d+) and the chart caps buckets\s+at\s+(\d+)\s+SERVER-SIDE`).FindStringSubmatch(text)
+	if caps == nil {
+		t.Fatal("docs/mcp.md must state the server-side group and bucket caps")
+	}
+	if caps[1] != strconv.Itoa(explorerMaxGroups) || caps[2] != strconv.Itoa(chartMaxBuckets) {
+		t.Fatalf("docs/mcp.md states server-side caps %s and %s, the owners are %d and %d",
+			caps[1], caps[2], explorerMaxGroups, chartMaxBuckets)
+	}
+
+	// Credential fragment floor: internal/mcp/client.go minRedactionRun.
+	if phrase := fmt.Sprintf("any contiguous %d-byte fragment", minRedactionRun); !strings.Contains(text, phrase) {
+		t.Fatalf("docs/mcp.md must state %q (the credential fragment floor)", phrase)
+	}
+
+	// Nesting bound: internal/mcp/client.go maxPercentLayers, which the guide
+	// quotes as a word and wraps across a line. The word list is deliberate: a
+	// bound that outgrows it must extend this guard rather than silently stop
+	// being pinned.
+	words := []string{"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"}
+	if maxPercentLayers >= len(words) {
+		t.Fatalf("maxPercentLayers = %d is beyond the guard's word list; extend the guard", maxPercentLayers)
+	}
+	if phrase := regexp.MustCompile(words[maxPercentLayers] + `\s+escape\s+applications`); !phrase.MatchString(text) {
+		t.Fatalf("docs/mcp.md must state %q (owner: internal/mcp/client.go maxPercentLayers)",
+			words[maxPercentLayers]+" escape applications")
+	}
+
+	// Excerpt bound: internal/mcp/client.go maxErrorBodyBytes and
+	// truncationMarker, whose length the guide quotes as well.
+	if maxErrorBodyBytes%1024 != 0 {
+		t.Fatalf("maxErrorBodyBytes = %d is no longer a whole number of KiB; update the guide and this guard", maxErrorBodyBytes)
+	}
+	kib := maxErrorBodyBytes / 1024
+	// The guide wraps "truncated to" and the size onto separate lines, so the
+	// derived phrase starts at the size.
+	for _, phrase := range []string{
+		fmt.Sprintf("%d KiB before the `%s` marker is appended", kib, truncationMarker),
+		fmt.Sprintf("runs up to the %d-byte marker past %d KiB", len(truncationMarker), kib),
+	} {
+		if !strings.Contains(text, phrase) {
+			t.Fatalf("docs/mcp.md must state %q (the excerpt bound)", phrase)
+		}
+	}
+}
+
+// TestGuidePinsTheFilterVocabularies pins the four hand-written value lists in
+// docs/mcp.md to their owners: the filter dimensions (Dimensions), the time
+// dayparts (TimeBuckets), the status classes (StatusClasses), all in
+// internal/mcp, and the live in-flight classes (LiveStatusClasses). The
+// backticked list after each heading is parsed in order and compared exactly,
+// so a value added to either side fails until both match. The live-class list
+// is parenthesized rather than sentence-final, so it gets its own parse.
+func TestGuidePinsTheFilterVocabularies(t *testing.T) {
+	guide, err := os.ReadFile(filepath.Join("..", "..", "docs", "mcp.md"))
+	if err != nil {
+		t.Fatalf("read the MCP guide: %v", err)
+	}
+	text := string(guide)
+	for _, tc := range []struct {
+		name    string
+		heading string
+		want    []string
+	}{
+		{"filter dimensions", "`dim` is one of ", Dimensions},
+		{"time dayparts", "buckets are ", TimeBuckets},
+		{"status classes", "not HTTP shorthand: ", StatusClasses},
+	} {
+		index := strings.Index(text, tc.heading)
+		if index < 0 {
+			t.Fatalf("docs/mcp.md must keep the %s sentence starting %q", tc.name, tc.heading)
+		}
+		// The list is the sentence right after the heading; the next sentence
+		// describes the values, so the scan stops at the first period.
+		sentence := text[index+len(tc.heading):]
+		if dot := strings.Index(sentence, "."); dot >= 0 {
+			sentence = sentence[:dot]
+		}
+		matches := regexp.MustCompile("`([a-z0-9]+)`").FindAllStringSubmatch(sentence, -1)
+		listed := make([]string, 0, len(matches))
+		for _, match := range matches {
+			listed = append(listed, match[1])
+		}
+		if !reflect.DeepEqual(listed, tc.want) {
+			t.Fatalf("docs/mcp.md lists %v for the %s, the owner is %v", listed, tc.name, tc.want)
+		}
+	}
+
+	// Live in-flight classes: internal/mcp/scope.go LiveStatusClasses. The
+	// guide states them inside the parentheses after "a live in-flight class",
+	// before the following sentence about the explorer's status classes, so the
+	// parse stops at the closing parenthesis.
+	const liveHeading = "live in-flight class ("
+	liveIndex := strings.Index(text, liveHeading)
+	if liveIndex < 0 {
+		t.Fatalf("docs/mcp.md must keep the live in-flight class list starting %q", liveHeading)
+	}
+	parenthetical := text[liveIndex+len(liveHeading):]
+	if end := strings.Index(parenthetical, ")"); end >= 0 {
+		parenthetical = parenthetical[:end]
+	}
+	matches := regexp.MustCompile("`([a-z0-9]+)`").FindAllStringSubmatch(parenthetical, -1)
+	listed := make([]string, 0, len(matches))
+	for _, match := range matches {
+		listed = append(listed, match[1])
+	}
+	if !reflect.DeepEqual(listed, LiveStatusClasses) {
+		t.Fatalf("docs/mcp.md lists %v for the live in-flight classes, the owner is %v (internal/mcp scope.go LiveStatusClasses)",
+			listed, LiveStatusClasses)
+	}
+}

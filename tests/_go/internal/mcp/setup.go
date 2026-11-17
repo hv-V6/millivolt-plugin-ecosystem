@@ -1,0 +1,512 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/LLM-4-People/millivolt/internal/config"
+)
+
+// TestSetupValidation pins the fail-fast rules: a missing credential or a
+// malformed origin is a setup error, and a trailing slash is normalized.
+func TestSetupValidation(t *testing.T) {
+	valid := "0123456789abcdef"
+
+	for _, tc := range []struct {
+		name  string
+		url   string
+		token string
+		want  string
+		// exact compares the whole message instead of a substring. The
+		// credential refusal needs it: a substring check also accepted a
+		// stale suffix, so a drift there stayed invisible.
+		exact bool
+	}{
+		{"missing url", "", valid, "proxy URL is required", false},
+		{"missing token", "http://127.0.0.1:8081", "", "operator token is required", false},
+		{"short token", "http://127.0.0.1:8081", "0123456789abcde", "at least 16", false},
+		{"long token", "http://127.0.0.1:8081", strings.Repeat("x", OperatorTokenMaxLen+1), "at most 512", false},
+		{"wrong scheme", "ftp://127.0.0.1:8081", valid, "http or https", false},
+		{"no host", "http://", valid, "must include a host", false},
+		{"path", "http://127.0.0.1:8081/admin", valid, "no path", false},
+		{"query", "http://127.0.0.1:8081/?a=1", valid, "query or fragment", false},
+		{"fragment", "http://127.0.0.1:8081#x", valid, "query or fragment", false},
+		{"credentials in url", "http://user:pass@127.0.0.1:8081", valid,
+			"proxy URL must not carry credentials", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewService(tc.url, tc.token, defaultTestLimits())
+			if err == nil {
+				t.Fatalf("setup must fail for %s", tc.name)
+			}
+			if tc.exact {
+				if err.Error() != tc.want {
+					t.Fatalf("error %q must be exactly %q", err, tc.want)
+				}
+			} else if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q must mention %q", err, tc.want)
+			}
+			assertNoToken(t, "setup error", err.Error())
+		})
+	}
+
+	// The length band is inclusive at both ends, like the proxy's boot check.
+	for _, token := range []string{
+		strings.Repeat("x", OperatorTokenMinLen),
+		strings.Repeat("x", OperatorTokenMaxLen),
+	} {
+		if _, err := NewService("http://127.0.0.1:8081", token, defaultTestLimits()); err != nil {
+			t.Fatalf("a %d character token must be accepted: %v", len(token), err)
+		}
+	}
+
+	// Trailing slashes normalize to a bare origin, and the origin never carries
+	// the credential.
+	for _, raw := range []string{"http://127.0.0.1:8081/", "  http://127.0.0.1:8081/  ", "http://127.0.0.1:8081"} {
+		service, err := NewService(raw, valid, defaultTestLimits())
+		if err != nil {
+			t.Fatalf("%q must normalize: %v", raw, err)
+		}
+		if got := service.Origin(); got != "http://127.0.0.1:8081" {
+			t.Fatalf("Origin() = %q, want the normalized origin", got)
+		}
+		if strings.Contains(service.Origin(), valid) {
+			t.Fatal("the origin must never carry the credential")
+		}
+	}
+}
+
+// TestLimitsValidation pins that an unusable limits policy is a setup failure
+// rather than a per-call surprise.
+func TestLimitsValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Limits)
+		want   string
+	}{
+		{"no query rows", func(l *Limits) { l.QueryMaxRows = 0 }, "query max rows"},
+		{"query rows above ceiling", func(l *Limits) { l.QueryMaxRows = 100001 }, "query max rows"},
+		{"no query bytes", func(l *Limits) { l.QueryMaxBytes = 0 }, "query max bytes"},
+		{"no page size", func(l *Limits) { l.PageSize = 0 }, "page size"},
+		{"page size below floor", func(l *Limits) { l.PageSize = 9 }, "page size"},
+		{"page size above ceiling", func(l *Limits) { l.PageSize = 501 }, "page size"},
+		{"no capture bytes", func(l *Limits) { l.CaptureBytes = 0 }, "capture bytes"},
+		{"no query timeout", func(l *Limits) { l.QueryTimeout = 0 }, "query timeout"},
+		{"no timeout", func(l *Limits) { l.Timeout = 0 }, "request timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			limits := defaultTestLimits()
+			tc.mutate(&limits)
+			if _, err := NewService("http://127.0.0.1:8081", "0123456789abcdef", limits); err == nil ||
+				!strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("limits error = %v, want one mentioning %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestLimitsBandBoundaries pins that Limits.Validate accepts the shared band
+// endpoints and rejects one past either end.
+func TestLimitsBandBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Limits)
+	}{
+		{"page size minimum", func(l *Limits) { l.PageSize = 10 }},
+		{"page size maximum", func(l *Limits) { l.PageSize = 500 }},
+		{"query rows minimum", func(l *Limits) { l.QueryMaxRows = 1 }},
+		{"query rows maximum", func(l *Limits) { l.QueryMaxRows = 100000 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			limits := defaultTestLimits()
+			tc.mutate(&limits)
+			if err := limits.Validate(); err != nil {
+				t.Fatalf("Validate() = %v, want the boundary accepted", err)
+			}
+		})
+	}
+}
+
+// TestMCPBoundaryConfigServesDefaultCalls pins that a config at either end of
+// both bands still arms an endpoint whose default records, values, audit and
+// query calls work. The bug was a config band wider than the tool band: the
+// config validated, then every default call failed.
+func TestMCPBoundaryConfigServesDefaultCalls(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		pageSize     int
+		queryMaxRows int
+	}{
+		{"minimums", 10, 1},
+		{"maximums", 500, 100000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.MCPPageSize = tc.pageSize
+			cfg.MCPQueryMaxRows = tc.queryMaxRows
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("boundary config Validate() = %v", err)
+			}
+			limits := LimitsFromConfig(cfg)
+			if err := limits.Validate(); err != nil {
+				t.Fatalf("boundary Limits.Validate() = %v", err)
+			}
+
+			rows := make([]string, 0, 5)
+			for i := range 5 {
+				rows = append(rows, `{"id":"r`+string(rune('a'+i))+`","started_at":`+strconv.Itoa(50-i)+`,"value":"v`+string(rune('a'+i))+`","requests":1}`)
+			}
+			proxy := newFakeProxy(t)
+			proxy.json(http.MethodGet, bootstrapPath, minimalBootstrap)
+			proxy.json(http.MethodGet, logPath,
+				`{"records":[`+strings.Join(rows, ",")+`],"more":false,"cursor_ms":46,"cursor_id":"ra"}`)
+			proxy.json(http.MethodGet, schemaPath, `[`+strings.Join(rows, ",")+`]`)
+			service := newTestService(t, proxy, limits)
+			ctx := context.Background()
+
+			query, err := service.query(ctx, QueryInput{SQL: "SELECT id FROM requests"})
+			if err != nil {
+				t.Fatalf("default query: %v", err)
+			}
+			if want := min(5, tc.queryMaxRows); query.RowCount != want {
+				t.Fatalf("default query row count = %d, want %d", query.RowCount, want)
+			}
+			if _, err := service.records(ctx, RecordsInput{}); err != nil {
+				t.Fatalf("default records: %v", err)
+			}
+			if _, err := service.values(ctx, ValuesInput{Dim: "client"}); err != nil {
+				t.Fatalf("default values: %v", err)
+			}
+			if _, err := service.auditCapturesList(ctx, AuditCapturesListInput{}); err != nil {
+				t.Fatalf("default audit captures list: %v", err)
+			}
+		})
+	}
+}
+
+// TestExplicitMaxRowsAboveConfiguredDefault preserves the documented query
+// contract: max_rows is the default, not a cap, so an explicit argument may
+// exceed it up to the config maximum.
+func TestExplicitMaxRowsAboveConfiguredDefault(t *testing.T) {
+	cfg := config.Default()
+	cfg.MCPQueryMaxRows = 1
+	limits := LimitsFromConfig(cfg)
+	if err := limits.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	rows := make([]string, 0, 5)
+	for i := range 5 {
+		rows = append(rows, `{"id":"r`+strconv.Itoa(i)+`"}`)
+	}
+	proxy := newFakeProxy(t)
+	proxy.json(http.MethodGet, schemaPath, `[`+strings.Join(rows, ",")+`]`)
+	service := newTestService(t, proxy, limits)
+
+	defaulted, err := service.query(context.Background(), QueryInput{SQL: "SELECT 1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaulted.RowCount != 1 {
+		t.Fatalf("default query rows = %d, want the configured default 1", defaulted.RowCount)
+	}
+	explicit, err := service.query(context.Background(), QueryInput{SQL: "SELECT 1", MaxRows: 5})
+	if err != nil {
+		t.Fatalf("explicit max_rows above the default: %v", err)
+	}
+	if explicit.RowCount != 5 || explicit.Truncation.Truncated {
+		t.Fatalf("explicit max_rows = %+v, want all 5 rows without truncation", explicit)
+	}
+	atCeiling, err := service.query(context.Background(),
+		QueryInput{SQL: "SELECT 1", MaxRows: 100000})
+	if err != nil {
+		t.Fatalf("max_rows at the ceiling: %v", err)
+	}
+	if atCeiling.RowCount != 5 {
+		t.Fatalf("max_rows at the ceiling returned %d rows, want 5", atCeiling.RowCount)
+	}
+	if _, err := service.query(context.Background(),
+		QueryInput{SQL: "SELECT 1", MaxRows: 100001}); err == nil {
+		t.Fatal("max_rows above the ceiling must be refused")
+	}
+}
+
+// TestConfigDefaultLimitsAreTheEndpointPolicy re-homes the removed
+// DefaultLimits pin: the shipped limits values have exactly one owner,
+// internal/config Default(), and LimitsFromConfig is the mapping onto the
+// endpoint's Limits. Exact literals, not the owning constants, so a change
+// on the owning side fails here.
+func TestConfigDefaultLimitsAreTheEndpointPolicy(t *testing.T) {
+	got := LimitsFromConfig(config.Default())
+	want := Limits{
+		QueryMaxRows:  200,
+		QueryMaxBytes: 128 << 10,
+		PageSize:      50,
+		CaptureBytes:  256 << 10,
+		QueryTimeout:  2 * time.Minute,
+		Timeout:       30 * time.Second,
+	}
+	if got != want {
+		t.Fatalf("LimitsFromConfig(config.Default()) = %+v, want the shipped policy %+v", got, want)
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatalf("the shipped policy must validate: %v", err)
+	}
+}
+
+// TestTokenNeverAppearsInToolOutput pins the confidentiality property on the
+// explore path: a reflected failure excerpt and a success payload never contain
+// the credential, and the recorded wire traffic carries it only in the
+// Authorization header. The other reflection paths are covered where they are
+// driven: the query excerpt by TestErrorBodyIsRedactedOfTheCredential, the
+// config-patch body by TestSetConfigRedactsTheCredentialOnTheToleratedPath, and
+// every registered read tool's output by TestRegisteredToolsReachTheProxy.
+func TestTokenNeverAppearsInToolOutput(t *testing.T) {
+	proxy := newFakeProxy(t)
+	// The fake echoes the credential into its error body, which is the worst
+	// case a transport could face: the tool message must still be safe to log.
+	proxy.respond(http.MethodGet, explorerPath, cannedResponse{
+		Status: http.StatusInternalServerError, ContentType: "application/json",
+		Body: `{"error":"upstream repeated ` + testToken + `"}`,
+	})
+	proxy.json(http.MethodGet, bootstrapPath, minimalBootstrap)
+	proxy.json(http.MethodGet, debugPath, emptyDebugStatus)
+	proxy.json(http.MethodGet, schemaPath, `[{"type":"table","name":"requests","tbl_name":"requests","sql":"CREATE TABLE requests"}]`)
+	service := newTestService(t, proxy, Limits{})
+	ctx := context.Background()
+
+	// A failure whose text happens to contain the credential is still a tool
+	// message; the operator's own proxy would never send that, and if it did the
+	// credential is already the caller's own input. What must never happen is
+	// this server ADDING it.
+	_, err := service.explore(ctx, ExploreInput{Dim: "provider"})
+	if err == nil {
+		t.Fatal("expected the echoed failure")
+	}
+	// The reflected excerpt is model-visible text, so the credential must be
+	// gone from it, not only from the success payload checked below.
+	assertRedacted(t, testToken, "explore failure", err.Error())
+
+	// Now check the success path: no serialized tool output contains it.
+	proxy.json(http.MethodGet, explorerPath, `{"dim":"provider","total":1,"groups":[{"name":"local"}],"rail":{},"scope":{}}`)
+	out, err := service.explore(ctx, ExploreInput{Dim: "provider"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, marshalErr := json.Marshal(out)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	assertNoToken(t, "explore output", string(encoded))
+
+	// And on the wire the credential appears only in the Authorization header.
+	for _, request := range proxy.requests() {
+		assertNoToken(t, request.Method+" "+request.Path+" url", request.Query.Encode())
+		assertNoToken(t, request.Method+" "+request.Path+" body", request.Body)
+	}
+	origin := proxy.origin()
+	if strings.Contains(origin, testToken) {
+		t.Fatal("the credential must never appear in the request origin")
+	}
+}
+
+// TestQueryTruncatesWithAnExplicitMarker pins the volume discipline: a
+// runaway result is cut at the configured cap and the withholding is stated.
+func TestQueryTruncatesWithAnExplicitMarker(t *testing.T) {
+	proxy := newFakeProxy(t)
+	var body strings.Builder
+	body.WriteString("[")
+	for i := range 12 {
+		if i > 0 {
+			body.WriteString(",")
+		}
+		body.WriteString(`{"id":"r` + string(rune('a'+i)) + `"}`)
+	}
+	body.WriteString("]")
+	proxy.json(http.MethodGet, schemaPath, body.String())
+
+	limits := defaultTestLimits()
+	limits.QueryMaxRows = 5
+	service := newTestService(t, proxy, limits)
+
+	out, err := service.query(context.Background(), QueryInput{SQL: "SELECT id FROM requests"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.RowCount != 5 || len(out.Rows) != 5 {
+		t.Fatalf("row cap not applied: %+v", out.Truncation)
+	}
+	if !out.Truncation.Truncated || out.Truncation.Shown != 5 || out.Truncation.Total != 12 {
+		t.Fatalf("truncation = %+v", out.Truncation)
+	}
+	if !strings.Contains(out.Truncation.Marker, "5 of 12") || !strings.Contains(out.Truncation.Marker, "rows") {
+		t.Fatalf("marker = %q, must state what was withheld", out.Truncation.Marker)
+	}
+
+	// An explicit max_rows wins over the configured default.
+	explicit, err := service.query(context.Background(), QueryInput{SQL: "SELECT id FROM requests", MaxRows: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicit.RowCount != 2 || explicit.Truncation.Total != 12 {
+		t.Fatalf("explicit max_rows ignored: %+v", explicit.Truncation)
+	}
+	// A page that fits reports no truncation.
+	fits, err := service.query(context.Background(), QueryInput{SQL: "SELECT id FROM requests", MaxRows: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fits.Truncation.Truncated || fits.Truncation.Marker != "" || fits.RowCount != 12 {
+		t.Fatalf("a fitting result must not claim truncation: %+v", fits.Truncation)
+	}
+	if _, err := service.query(context.Background(), QueryInput{SQL: "SELECT 1", MaxRows: config.MCPQueryMaxRowsMax + 1}); err == nil {
+		t.Fatal("an absurd max_rows must be refused")
+	}
+}
+
+// TestQueryRejectsNonSelectLocally pins the local pre-check, and that the proxy
+// remains the authority: a statement this check passes is still sent.
+func TestQueryRejectsNonSelectLocally(t *testing.T) {
+	proxy := newFakeProxy(t)
+	proxy.json(http.MethodGet, schemaPath, `[]`)
+	service := newTestService(t, proxy, Limits{})
+	for _, sql := range []string{"", "   ", "DELETE FROM requests", "SELECT 1; DROP TABLE requests"} {
+		if _, err := service.query(context.Background(), QueryInput{SQL: sql}); err == nil {
+			t.Fatalf("%q must be refused locally", sql)
+		}
+	}
+	if len(proxy.requests()) != 0 {
+		t.Fatal("a locally refused statement must not reach the proxy")
+	}
+	// The proxy still answers 413 for its own row/byte ceiling, which the tool
+	// surfaces as the proxy's message.
+	proxy.fail(http.MethodGet, schemaPath, http.StatusRequestEntityTooLarge, "query limit exceeded", "")
+	if _, err := service.query(context.Background(), QueryInput{SQL: "SELECT 1"}); err == nil ||
+		!strings.Contains(err.Error(), "413") {
+		t.Fatalf("the proxy's own ceiling must surface as an error, got %v", err)
+	}
+}
+
+// TestListingToolsTruncateWithAMarker pins the same discipline on every listing
+// tool, including the ones whose size is the proxy's choice rather than ours.
+func TestListingToolsTruncateWithAMarker(t *testing.T) {
+	proxy := newFakeProxy(t)
+	// The proxy may answer more groups than its documented cap; the tool states
+	// the withholding rather than passing it on as if complete.
+	groups := make([]string, 0, explorerMaxGroups+4)
+	for i := range explorerMaxGroups + 4 {
+		groups = append(groups, `{"name":"g`+string(rune('a'+i))+`","n":1}`)
+	}
+	proxy.json(http.MethodGet, explorerPath, `{"dim":"provider","total":30,"groups":[`+strings.Join(groups, ",")+`],"rail":{},"scope":{}}`)
+	buckets := make([]string, 0, chartMaxBuckets+3)
+	for i := range chartMaxBuckets + 3 {
+		buckets = append(buckets, `{"t":`+string(rune('0'+i%10))+`,"req":1}`)
+	}
+	proxy.json(http.MethodGet, chartPath, `{"now_ms":1,"from_ms":0,"bucket_ms":1,"buckets":[`+strings.Join(buckets, ",")+`]}`)
+	records := make([]string, 0, 12)
+	for i := range 12 {
+		records = append(records, `{"id":"r`+string(rune('a'+i))+`"}`)
+	}
+	proxy.json(http.MethodGet, logPath, `{"records":[`+strings.Join(records, ",")+`],"more":true,"cursor_ms":9,"cursor_id":"rl"}`)
+	snapshotRecords := make([]string, 0, 12)
+	for i := range 12 {
+		snapshotRecords = append(snapshotRecords, `{"id":"n`+string(rune('a'+i))+`"}`)
+	}
+	proxy.json(http.MethodGet, bootstrapPath, `{"seq":1,"feed_id":"f","counters":{},"storage":{"enabled":true},`+
+		`"records":[`+strings.Join(snapshotRecords, ",")+`]}`)
+	proxy.respond(http.MethodGet, prometheusPat, cannedResponse{
+		Status: http.StatusOK, ContentType: "text/plain",
+		Body: strings.Repeat("metric 1\n", prometheusMaxLines+10),
+	})
+
+	limits := defaultTestLimits()
+	limits.PageSize = config.MCPPageSizeMin
+	service := newTestService(t, proxy, limits)
+	ctx := context.Background()
+
+	explorer, err := service.explore(ctx, ExploreInput{Dim: "provider"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(explorer.Groups) != explorerMaxGroups || !explorer.Truncation.Truncated {
+		t.Fatalf("explorer truncation = %+v (%d groups)", explorer.Truncation, len(explorer.Groups))
+	}
+
+	chart, err := service.chart(ctx, ChartInput{Window: "5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chart.Buckets) != chartMaxBuckets || !chart.Truncation.Truncated {
+		t.Fatalf("chart truncation = %+v (%d buckets)", chart.Truncation, len(chart.Buckets))
+	}
+
+	page, err := service.records(ctx, RecordsInput{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Records) != 10 || !page.Truncation.Truncated || page.Truncation.Total != 12 {
+		t.Fatalf("records truncation = %+v (%d rows)", page.Truncation, len(page.Records))
+	}
+
+	snapshot, err := service.snapshot(ctx, SnapshotInput{MaxRecords: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Records) != 4 || !snapshot.Truncation.Truncated {
+		t.Fatalf("snapshot truncation = %+v", snapshot.Truncation)
+	}
+
+	prom, err := service.prometheus(ctx, PrometheusInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prom.Lines != prometheusMaxLines || !prom.Truncation.Truncated {
+		t.Fatalf("prometheus truncation = %+v (%d lines)", prom.Truncation, prom.Lines)
+	}
+
+	// Every marker names the numbers so the model can size the next request.
+	for _, marker := range []string{
+		explorer.Truncation.Marker, chart.Truncation.Marker,
+		page.Truncation.Marker, snapshot.Truncation.Marker, prom.Truncation.Marker,
+	} {
+		if marker == "" || !strings.Contains(marker, "truncated:") {
+			t.Fatalf("marker %q must state the withholding", marker)
+		}
+	}
+}
+
+// TestQueryReportsTheProxysTotalWhenBothLimitsFire pins the honest number when
+// BOTH clamps withhold rows. The byte clamp runs after the row cap, so its input
+// is already shortened; reporting that intermediate as the total would tell a
+// model a 200-row result out of 500 was complete.
+func TestQueryReportsTheProxysTotalWhenBothLimitsFire(t *testing.T) {
+	rows := make([]string, 0, 12)
+	for i := range 12 {
+		rows = append(rows, `{"id":"r`+string(rune('a'+i))+`","blob":"`+strings.Repeat("x", 200)+`"}`)
+	}
+	proxy := newFakeProxy(t)
+	proxy.json(http.MethodGet, schemaPath, `[`+strings.Join(rows, ",")+`]`)
+
+	limits := defaultTestLimits()
+	limits.QueryMaxRows = 3    // the row cap fires first
+	limits.QueryMaxBytes = 400 // and the byte cap fires second
+	service := newTestService(t, proxy, limits)
+
+	out, err := service.query(context.Background(), QueryInput{SQL: "SELECT * FROM requests"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.RowCount >= 3 {
+		t.Fatalf("the byte cap must cut below the row cap: %d rows", out.RowCount)
+	}
+	if out.Truncation.Total != 12 {
+		t.Fatalf("the reported total must be the proxy's 12 rows, not the row-capped 3: %+v", out.Truncation)
+	}
+	if !strings.Contains(out.Truncation.Marker, "0 of 12") && !strings.Contains(out.Truncation.Marker, " of 12 rows") {
+		t.Fatalf("the marker must name the proxy's total: %q", out.Truncation.Marker)
+	}
+}

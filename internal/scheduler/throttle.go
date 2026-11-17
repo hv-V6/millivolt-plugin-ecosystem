@@ -1,0 +1,601 @@
+package scheduler
+
+import (
+	"sort"
+	"sync"
+	"time"
+)
+
+// Throttle sources. The dashboard and the X-Proxy-Limit-* headers share
+// SetThrottle; Source is what the UI shows for "who set this".
+const (
+	ThrottleSourceUI     = "ui"
+	ThrottleSourceHeader = "header"
+	// TokensUnavailable is a settlement state, not a token count. Retain the
+	// admitted reservation when actual usage is unavailable; still free the
+	// lease's concurrency slot. No replacement count is invented.
+	TokensUnavailable int64 = -1
+)
+
+// Limit is the three per-provider caps. Zero on a dimension means that
+// dimension is off (unlimited). A Limit with every dimension zero is
+// inactive - SetThrottle then drops the provider from the map.
+type Limit struct {
+	Concurrency int           // in-flight requests across every key; 0 = off
+	Requests    int64         // max requests per ReqWindow; 0 = off
+	ReqWindow   time.Duration // window for Requests; ignored when Requests == 0
+	Tokens      int64         // max tokens per TokWindow; 0 = off
+	TokWindow   time.Duration // window for Tokens; ignored when Tokens == 0
+}
+
+// Active reports whether any dimension is on. Deny-by-default: a zero
+// Limit is not a throttle.
+func (l Limit) Active() bool {
+	return l.Concurrency > 0 ||
+		(l.Requests > 0 && l.ReqWindow > 0) ||
+		(l.Tokens > 0 && l.TokWindow > 0)
+}
+
+func (l Limit) normalized() Limit {
+	if l.Requests == 0 {
+		l.ReqWindow = 0
+	}
+	if l.Tokens == 0 {
+		l.TokWindow = 0
+	}
+	return l
+}
+
+// Throttle is one provider's persisted cap, plus who last wrote it.
+type Throttle struct {
+	Provider  string
+	Limit     Limit
+	Source    string // ThrottleSourceUI or ThrottleSourceHeader
+	UpdatedBy string // client label (header) or "dashboard" (UI)
+	UpdatedAt time.Time
+}
+
+// ThrottleInfo is Throttle plus live occupancy, for GET /admin/throttle
+// and the dashboard. Remaining values are the token-bucket fill (0..cap).
+type ThrottleInfo struct {
+	Throttle
+	InFlight     int     `json:"in_flight"`
+	Queued       int     `json:"queued"`
+	ReqRemaining float64 `json:"requests_remaining"`
+	TokRemaining float64 `json:"tokens_remaining"`
+	ReqCapacity  float64 `json:"requests_capacity"`
+	TokCapacity  float64 `json:"tokens_capacity"`
+}
+
+// bucket is a token bucket (capacity = limit, refill = limit/window).
+// tokens may go negative (debt) when a single request is larger than the
+// remaining fill - that request is allowed; subsequent admits wait until
+// refill brings the bucket back above zero. Internal, not a config knob.
+type bucket struct {
+	enabled  bool
+	rate     float64 // units per second
+	capacity float64
+	tokens   float64
+	last     time.Time
+}
+
+func (b *bucket) refill(now time.Time) {
+	if !b.enabled || b.rate <= 0 {
+		return
+	}
+	if b.last.IsZero() {
+		b.last = now
+		return
+	}
+	elapsed := now.Sub(b.last).Seconds()
+	if elapsed <= 0 {
+		return
+	}
+	b.tokens += elapsed * b.rate
+	if b.tokens > b.capacity {
+		b.tokens = b.capacity
+	}
+	b.last = now
+}
+
+func (b *bucket) reset(count int64, window time.Duration, now time.Time) {
+	if count <= 0 || window <= 0 {
+		b.enabled = false
+		b.rate = 0
+		b.capacity = 0
+		b.tokens = 0
+		b.last = time.Time{}
+		return
+	}
+	cap := float64(count)
+	rate := cap / window.Seconds()
+	if b.enabled {
+		b.refill(now)
+		if cap > b.capacity {
+			b.tokens += cap - b.capacity
+			if b.tokens > cap {
+				b.tokens = cap
+			}
+		} else if b.tokens > cap {
+			b.tokens = cap // tighten: fail closed on the new burst
+		}
+	} else {
+		b.tokens = cap // newly enabled: start full (don't punish past traffic)
+	}
+	b.enabled = true
+	b.capacity = cap
+	b.rate = rate
+	b.last = now
+}
+
+// maxBucketWait is the ceiling on one bucket waitFor: the exact refill time
+// of a deep debt (need/rate) can exceed time.Duration's ~292-year span, and
+// the naive float-to-Duration conversion overflows to minInt64 - the
+// sub-millisecond floor would then clamp it to ~1ms and armThrottleDrain
+// would re-arm about a thousand times per second while the provider stays
+// token-blocked. The ceiling mirrors MaxRetryHint, the daily-quota window
+// maxLimitWindow is pinned to: a larger debt wakes once per ceiling and
+// re-arms, while settles and cap changes re-check admission anyway - the
+// timer is only a fallback heartbeat.
+const maxBucketWait = MaxRetryHint
+
+func (b *bucket) waitFor(n float64) time.Duration {
+	if !b.enabled || b.rate <= 0 {
+		return 0
+	}
+	now := time.Now()
+	b.refill(now)
+	if b.tokens >= n {
+		return 0
+	}
+	need := n - b.tokens
+	sec := need / b.rate
+	if sec > maxBucketWait.Seconds() {
+		sec = maxBucketWait.Seconds()
+	}
+	d := time.Duration(sec * float64(time.Second))
+	if d < time.Millisecond {
+		d = time.Millisecond
+	}
+	return d
+}
+
+// providerGate is the live limiter for one provider. The cap policy
+// (Throttle) and occupancy (inFlight, buckets) live together so SetThrottle
+// and tryAdmit share one mutex. The map of gates is the single owner of
+// provider limits.
+type providerGate struct {
+	mu       sync.Mutex
+	throttle Throttle
+	inFlight int
+	reserved int64 // sum of in-flight token reservations (stats only)
+	req      bucket
+	tok      bucket
+	tokEpoch uint64 // increments when the token dimension is enabled/disabled
+	wake     wakeTimer
+}
+
+// admission is the immutable ownership proof captured while a gate grants.
+// The gate owns concurrency; the token epoch identifies the bucket incarnation.
+type admission struct {
+	gate     *providerGate
+	reserved int64
+	tokEpoch uint64
+}
+
+func (g *providerGate) resetBuckets(l Limit, now time.Time) {
+	if g.tok.enabled != (l.Tokens > 0 && l.TokWindow > 0) {
+		g.tokEpoch++
+	}
+	g.req.reset(l.Requests, l.ReqWindow, now)
+	g.tok.reset(l.Tokens, l.TokWindow, now)
+}
+
+// blocked reports whether this gate refuses a request estimated at est
+// tokens right now, and how long until the blocking dimension could admit
+// (0 when the concurrency cap blocks: that waits for a release, not a
+// timer). The caller must hold g.mu: the bucket refills it performs are
+// the same mutations an admitting caller then relies on. tryAdmit applies
+// its reservation only after this returns false; throttleBlocked only
+// tests.
+func (g *providerGate) blocked(est int64) (bool, time.Duration) {
+	if !g.throttle.Limit.Active() {
+		return false, 0
+	}
+	now := time.Now()
+	g.req.refill(now)
+	g.tok.refill(now)
+	lim := g.throttle.Limit
+	if lim.Concurrency > 0 && g.inFlight >= lim.Concurrency {
+		return true, 0 // wait for release, not a timer
+	}
+	if g.req.enabled && g.req.tokens < 1 {
+		return true, g.req.waitFor(1)
+	}
+	if g.tok.enabled {
+		need := float64(est)
+		switch {
+		case need <= 0:
+			// No estimate: don't reserve. Block only when already empty
+			// (settle will debit actual usage after the fact).
+			if g.tok.tokens <= 0 {
+				return true, g.tok.waitFor(1)
+			}
+		case need > g.tok.capacity:
+			// One request larger than the window cannot be fragmented.
+			// Allow it if we are not already in debt; it exhausts the bucket.
+			if g.tok.tokens <= 0 {
+				return true, g.tok.waitFor(1)
+			}
+		case g.tok.tokens < need:
+			return true, g.tok.waitFor(need)
+		}
+	}
+	return false, 0
+}
+
+func (g *providerGate) tryAdmit(est int64) (ok bool, lease admission, wait time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	// An inactive limit admits with NO gate bookkeeping at all (nil lease,
+	// no occupancy) - distinct from active-and-admitted below, so this fork
+	// cannot fold into blocked.
+	if !g.throttle.Limit.Active() {
+		return true, admission{}, 0
+	}
+	if blocked, wait := g.blocked(est); blocked {
+		return false, admission{}, wait
+	}
+	// Admitted with a positive estimate: reserve it. The token switch above
+	// already let an oversize request out of debt - it exhausts the bucket
+	// here. A zero estimate reserves nothing (settle debits actual usage).
+	var reserved int64
+	if g.tok.enabled && est > 0 {
+		reserved = est
+	}
+	g.inFlight++
+	if g.req.enabled {
+		g.req.tokens--
+	}
+	if reserved > 0 {
+		g.tok.tokens -= float64(reserved)
+		g.reserved += reserved
+	}
+	return true, admission{gate: g, reserved: reserved, tokEpoch: g.tokEpoch}, 0
+}
+
+func (g *providerGate) snapshot(queued int) ThrottleInfo {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := time.Now()
+	g.req.refill(now)
+	g.tok.refill(now)
+	info := ThrottleInfo{Throttle: g.throttle, InFlight: g.inFlight, Queued: queued}
+	if g.req.enabled {
+		info.ReqRemaining = g.req.tokens
+		info.ReqCapacity = g.req.capacity
+	}
+	if g.tok.enabled {
+		info.TokRemaining = g.tok.tokens
+		info.TokCapacity = g.tok.capacity
+	}
+	return info
+}
+
+// SetThrottle replaces a provider cap, reporting whether its effective Limit
+// changed. Source, UpdatedBy and UpdatedAt describe the last policy change,
+// not the last request that repeated the same cap. Explicit installation
+// timestamps are preserved; absent timestamps are filled only on a change.
+func (s *Scheduler) SetThrottle(t Throttle) bool {
+	return s.UpdateThrottle(t.Provider, func(Throttle) Throttle { return t })
+}
+
+// UpdateThrottle atomically reads, merges and installs a provider policy.
+// update runs under the policy lock and must not block or call the scheduler.
+// An inactive Limit clears the provider. Equal effective limits are a true
+// no-op: no bucket reset, metadata update, timer cancellation or global kick.
+func (s *Scheduler) UpdateThrottle(provider string, update func(Throttle) Throttle) bool {
+	if provider == "" {
+		return false
+	}
+	s.throttleMu.Lock()
+	g := s.gates[provider]
+	var cur Throttle
+	if g != nil {
+		g.mu.Lock()
+		cur = g.throttle
+	}
+	t := update(cur)
+	t.Provider = provider
+	t.Limit = t.Limit.normalized()
+	if cur.Limit == t.Limit || g == nil && !t.Limit.Active() {
+		if g != nil {
+			g.mu.Unlock()
+		}
+		s.throttleMu.Unlock()
+		return false
+	}
+	if g != nil {
+		g.wake.stop()
+	}
+	if !t.Limit.Active() {
+		g.throttle = Throttle{}
+		g.mu.Unlock()
+		delete(s.gates, provider)
+		s.publishGatesLocked()
+		s.throttleMu.Unlock()
+		s.kickThrottles()
+		return true
+	}
+	if t.UpdatedAt.IsZero() {
+		t.UpdatedAt = time.Now()
+	}
+	if g == nil {
+		if len(s.gates) >= maxProviderGates {
+			// Header-driven limits are client-controlled. Beyond the cap a new
+			// provider name is ignored instead of growing the gate map forever.
+			s.throttleMu.Unlock()
+			return false
+		}
+		g = s.newProviderGate(provider)
+		g.mu.Lock()
+		if s.gates == nil {
+			s.gates = make(map[string]*providerGate)
+		}
+		s.gates[provider] = g
+		s.publishGatesLocked()
+	}
+	g.throttle = t
+	now := time.Now()
+	g.resetBuckets(t.Limit, now)
+	g.mu.Unlock()
+	s.throttleMu.Unlock()
+	s.kickThrottles()
+	return true
+}
+
+// ThrottlePolicies returns every active provider cap, sorted by provider,
+// without live occupancy. Durable persistence stores only policy, so it must
+// not pay ListThrottles' scan of every group and queued waiter. Every gate
+// policy write holds throttleMu, so reading g.throttle under that lock is
+// race-free and never takes a group mutex. Throttle has only value fields, so
+// the returned copies cannot alias later gate updates.
+func (s *Scheduler) ThrottlePolicies() []Throttle {
+	s.throttleMu.Lock()
+	out := make([]Throttle, 0, len(s.gates))
+	for _, g := range s.gates {
+		out = append(out, g.throttle)
+	}
+	s.throttleMu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })
+	return out
+}
+
+// ListThrottles returns every active provider cap, sorted by provider,
+// with live occupancy. The dashboard GET is this list. Persistence uses the
+// policy-only ThrottlePolicies instead.
+func (s *Scheduler) ListThrottles() []ThrottleInfo {
+	queued := s.throttleQueued()
+	s.throttleMu.Lock()
+	out := make([]ThrottleInfo, 0, len(s.gates))
+	for p, g := range s.gates {
+		out = append(out, g.snapshot(queued[p]))
+	}
+	s.throttleMu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })
+	return out
+}
+
+func (s *Scheduler) throttleQueued() map[string]int {
+	out := map[string]int{}
+	for _, g := range s.snapshotGroups() {
+		g.mu.Lock()
+		for _, w := range g.queue {
+			if w.provider != "" {
+				out[w.provider]++
+			}
+		}
+		g.mu.Unlock()
+	}
+	return out
+}
+
+// RestoreThrottles replaces the whole set (startup from SQLite). Does not
+// kick waiters - there are none yet at attach time.
+func (s *Scheduler) RestoreThrottles(ts []Throttle) {
+	s.throttleMu.Lock()
+	for _, g := range s.gates {
+		g.wake.stop()
+	}
+	s.gates = make(map[string]*providerGate, len(ts))
+	now := time.Now()
+	for _, t := range ts {
+		t.Limit = t.Limit.normalized()
+		if t.Provider == "" || !t.Limit.Active() {
+			continue
+		}
+		if t.UpdatedAt.IsZero() {
+			t.UpdatedAt = now
+		}
+		g := s.newProviderGate(t.Provider)
+		g.throttle = t
+		g.resetBuckets(t.Limit, now)
+		s.gates[t.Provider] = g
+	}
+	s.publishGatesLocked()
+	s.throttleMu.Unlock()
+}
+
+// maxProviderGates bounds header-driven provider caps. Configured providers
+// are restored explicitly and are not subject to the header-creation path.
+const maxProviderGates = 4096
+
+func (s *Scheduler) newProviderGate(provider string) *providerGate {
+	g := &providerGate{}
+	g.wake.fn = func() { s.drainProvider(provider) }
+	return g
+}
+
+func (s *Scheduler) gate(provider string) *providerGate {
+	if provider == "" {
+		return nil
+	}
+	snap := s.gateSnap.Load()
+	if snap == nil {
+		return nil
+	}
+	return (*snap)[provider]
+}
+
+// publishGatesLocked replaces the immutable read view. Callers hold
+// throttleMu; readers only load the pointer, so a hot-path admission never
+// waits for a policy writer.
+func (s *Scheduler) publishGatesLocked() {
+	snap := make(map[string]*providerGate, len(s.gates))
+	for p, g := range s.gates {
+		snap[p] = g
+	}
+	s.gateSnap.Store(&snap)
+}
+
+func (s *Scheduler) tryAdmit(provider string, est int64) (ok bool, lease admission, wait time.Duration) {
+	g := s.gate(provider)
+	if g == nil {
+		return true, admission{}, 0
+	}
+	return g.tryAdmit(est)
+}
+
+func (s *Scheduler) throttleBlocked(provider string, est int64) bool {
+	g := s.gate(provider)
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	blocked, _ := g.blocked(est)
+	return blocked
+}
+
+// finish settles and frees the gate captured at admission, never a fresh
+// provider-name lookup. A cleared/reinstalled limit has a different owner;
+// traffic admitted without a gate cannot charge a subsequently installed cap.
+// Token enable/disable starts a new epoch even when concurrency keeps the gate;
+// old reservations cannot debit/refund that new bucket. Enabled resizes retain
+// their epoch so outstanding usage still reconciles against the same debt.
+func (a admission) finish(actual int64) {
+	g := a.gate
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	if a.reserved != 0 {
+		g.reserved -= a.reserved
+		if g.reserved < 0 {
+			g.reserved = 0
+		}
+	}
+	if g.tok.enabled && g.tokEpoch == a.tokEpoch {
+		g.tok.refill(time.Now())
+		// Negative counts are unavailable, including an invalid caller value.
+		// The original reservation remains charged without a debit or refund.
+		if actual >= 0 {
+			g.tok.tokens -= float64(actual - a.reserved)
+		}
+	}
+	if g.inFlight > 0 {
+		g.inFlight--
+	}
+	g.mu.Unlock()
+	g.wake.fn() // shared provider drain, outside the gate lock
+}
+
+func (s *Scheduler) armThrottleDrain(provider string, d time.Duration) {
+	g := s.gate(provider)
+	if g == nil {
+		return
+	}
+	if d < time.Millisecond {
+		d = time.Millisecond
+	}
+	g.mu.Lock()
+	if g.throttle.Limit.Active() {
+		g.wake.arm(time.Now().Add(d), true)
+	}
+	g.mu.Unlock()
+}
+
+// drainProvider wakes only the groups attributed to provider. It reads the
+// provider index's queued-group counter under mu, releases mu before touching
+// any group, and returns immediately when the counter says no indexed group
+// holds a live waiter. Otherwise it snapshots only groups whose lock-free
+// witness is true under the index mutex, so idle groups neither allocate nor
+// delay a provider release beyond the short walk, and no allocation scales
+// with a provider's idle group count. Preserving the s.mu -> g.mu order every
+// other path uses: no path takes g.mu and then waits for s.mu; the index lock
+// is released before any g.drain.
+//
+// A release cannot lose a wake to a group created concurrently with it: the
+// new group is linked, its provider published and its counter pointer
+// installed under mu before its Acquire attempts admission or enqueues. A drain
+// that misses it therefore ran before that admission attempt. If the attempt
+// then blocks, its in-flight slot holders were admitted before the block and
+// their releases run after the link, so one of them drains the group; a
+// blocked token/request bucket also arms a provider timer that re-runs this
+// drain after the link. A waiter that enqueues after this drain's counter
+// check is covered by its own post-enqueue g.drain when capacity was released,
+// or by the later release that observes the counter the enqueue transition set
+// (see acquire's g.drain call after enqueue). The enqueue transition and the
+// counter move under the same g.mu owner, so a group cannot be counted while
+// empty or omitted while a live waiter waits.
+//
+// Eviction cannot remove a group whose queue holds a live waiter, so a
+// non-zero witness keeps every relevant group linked across this snapshot.
+//
+// Empty provider identity has no gate of its own (gate("") is nil); callers
+// that do reach here with an empty provider keep the previous full-drain
+// fallback instead of silently skipping every group. An unknown non-empty
+// provider has no attributed groups and correctly drains nothing.
+func (s *Scheduler) drainProvider(provider string) {
+	if provider == "" {
+		s.drainAll()
+		return
+	}
+	s.mu.Lock()
+	idx := s.providerGroups[provider]
+	if idx == nil || idx.queued.Load() == 0 {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+	for _, g := range idx.queuedSnapshot() {
+		if !g.hasQueued.Load() {
+			continue
+		}
+		g.drain()
+	}
+}
+
+func (s *Scheduler) kickThrottles() {
+	s.pauseMu.Lock()
+	s.kickPolicyLocked()
+	s.pauseMu.Unlock()
+	s.drainAll()
+}
+
+// Release settles actual usage and frees an acquisition exactly once, even
+// when called concurrently. Pass zero for cancellation/unused reservations,
+// or TokensUnavailable to retain the original reservation without settling
+// a fabricated actual count.
+// Every acquisition must be released, including one admitted without a cap.
+type Release func(actualTokens int64)
+
+func (g *group) slotRelease(a admission) Release {
+	var once sync.Once
+	return func(actual int64) {
+		once.Do(func() {
+			a.finish(actual)
+			g.release()
+		})
+	}
+}

@@ -1,0 +1,549 @@
+package config
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Kind is the UI/API type of one configurable. The dashboard renders a control
+// from this; Apply converts JSON into the Go field from this - never from a
+// second, parallel type table.
+type Kind string
+
+const (
+	KindString           Kind = "string"
+	KindInt              Kind = "int"
+	KindBytes            Kind = "bytes"
+	KindBool             Kind = "bool"
+	KindDuration         Kind = "duration"
+	KindStrings          Kind = "strings"
+	KindProviders        Kind = "providers"
+	KindAliases          Kind = "aliases"
+	KindModelRules       Kind = "model_rules"
+	KindRequestOverrides Kind = "request_overrides"
+	KindSubConversations Kind = "sub_conversations"
+)
+
+// Category groups fields in the Settings menu (and in the generated YAML).
+type Category struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Help  string `json:"help,omitempty"`
+}
+
+// Field is one user-tunable. Schema() is the single registry: the dashboard,
+// YAML writer, GET /admin/config, and Apply all read this. Defaults live only
+// in Default(); ranges here are the UI hint and must match Validate() (the
+// deny-by-default choke). Integer bands used in more than two places are
+// named constants (DashLogRowsMin/Max).
+type Field struct {
+	Key       string   `json:"key"`
+	Category  string   `json:"category"`
+	Label     string   `json:"label"`
+	Help      string   `json:"help"`
+	Kind      Kind     `json:"kind"`
+	HotReload bool     `json:"hot_reload"`
+	Min       *float64 `json:"min,omitempty"`
+	Max       *float64 `json:"max,omitempty"`
+	ZeroMeans string   `json:"zero_means,omitempty"`
+	Unit      string   `json:"unit,omitempty"`
+	// ZeroToken is the formatted zero for duration/bytes fields, filled by
+	// Schema from FormatDuration/FormatByteSize so Settings does not hardcode 0s/0B.
+	ZeroToken string `json:"zero_token,omitempty"`
+}
+
+func num(v float64) *float64 { return &v }
+
+// Categories is the Settings menu's section list, in display order.
+func Categories() []Category {
+	return []Category{
+		{ID: "server", Label: "Server", Help: "Bind address, database, and ring depth restart to apply. shutdown_timeout applies at the next SIGINT/SIGTERM."},
+		{ID: "request", Label: "Request", Help: "Inbound body cap, SSRF allowlist, optional body-preview, and debug-capture retention."},
+		{ID: "upstream", Label: "Upstream", Help: "Connection pool, header timeout, and stream keepalives."},
+		{ID: "queue", Label: "Queue & retry", Help: "Per-key concurrency, transparent 429/5xx retry, and quality re-asks."},
+		{ID: "storm", Label: "Error storm protection", Help: "Bounded recovery queues for affected providers or exact model names. Hot-reloads; policy changes clear observations and wake waiters. Banner visibility changes do not reset protection."},
+		{ID: "quota", Label: "Quota pause", Help: "Provider-wide reaction to a 429 carrying a durable quota/billing error (insufficient_quota/credits, spend limits): surface it immediately, park the provider behind a recovery gate, or hold it until an operator resumes."},
+		{ID: "conversation", Label: "Conversations", Help: "How the request log groups turns into conversations."},
+		{ID: "format", Label: "Format translation", Help: "Anthropic defaults and Cursor agent.v1 bridging."},
+		{ID: "storage", Label: "Storage", Help: "Durable SQLite write pipeline. Restart to apply."},
+		{ID: "backup", Label: "Backup", Help: "Download or restore a self-checked archive of the saved config, the SQLite history, or both. Restore inspects first: merge keeps live defaults and live request ids; replace writes the backup as-is."},
+		{ID: "mcp", Label: "MCP", Help: "The operator-gated /mcp LLM tool endpoint: mcp_enabled registers the route or keeps it reserved (404, never inference), and the limits bound what its tools return to a model. Restart to apply; the route table and the endpoint's services are built once at boot."},
+		{ID: "dashboard", Label: "Dashboard", Help: "Live-view cadence and request-log window. Hot-reloads; open dashboards pick up the next tick."},
+		{ID: "models", Label: "Models", Help: "Model grouping rules - an ordered rewrite pipeline merging spelling variants of the same model in every grouped surface. Records keep their exact spelling; hot-reloads."},
+		{ID: "providers", Label: "Providers", Help: "Optional per-provider JSON field-name maps: usage/cost response keys, the models metadata endpoint merged into /v1/models, ensured tool names injected into relayed chat bodies, and optional upstream wire headers. Empty = auto-detect."},
+		{ID: "overrides", Label: "Request overrides", Help: "Scoped rewrites of the upstream request: set, replace or remove HTTP headers and set output-token ceilings per client, provider and/or model. Rules match exactly, all matching rules apply in list order, and the later rule wins. Default: an empty list, the feature fully off."},
+		{ID: "plugins", Label: "Plugins", Help: "Declarative rule packs loaded from a directory at boot and reload. Rule packs contribute data only, never code, and cannot change boot-bound settings. Restart to apply directory changes."},
+	}
+}
+
+// schemaRegistry builds the schema once per process and shares it across all
+// callers. The slice is immutable after build; see Schema for the contract.
+var schemaRegistry = sync.OnceValue(func() []Field {
+	return withZeroTokens([]Field{
+		// ---- server ----
+		{Key: "listen", Category: "server", Label: "Listen address",
+			Help: "Host:port the HTTP server binds. Restart required.",
+			Kind: KindString, HotReload: false},
+		{Key: "db_path", Category: "server", Label: "Database path",
+			Help: "SQLite metrics store. Empty disables durability (ring only). Restart required.",
+			Kind: KindString, HotReload: false},
+		{Key: "history_size", Category: "server", Label: "History size",
+			Help: "In-memory ring depth and startup backfill count. Durable history and paged request logs can extend beyond this window. Restart required.",
+			Kind: KindInt, HotReload: false, Min: num(1), Max: num(1_000_000)},
+		{Key: "shutdown_timeout", Category: "server", Label: "Shutdown timeout",
+			Help: "HTTP shutdown wait after active request contexts are canceled on SIGINT/SIGTERM. Storage draining follows separately. Must be > 0; applies at the next shutdown without restarting the listener.",
+			Kind: KindDuration, HotReload: true},
+		{Key: "restart_drain_timeout", Category: "server", Label: "Restart drain timeout",
+			Help: "How long a dashboard-triggered restart waits for in-flight streams. Expiry aborts the restart and resumes accepting traffic; unfinished streams are not killed. New connections queue during a successful handoff.",
+			Kind: KindDuration, HotReload: true, Min: num(0), ZeroMeans: "wait indefinitely"},
+		{Key: "read_header_timeout", Category: "server", Label: "Read header timeout",
+			Help: "Slowloris guard on inbound headers. Restart required.",
+			Kind: KindDuration, HotReload: false, Min: num(0), ZeroMeans: "no timeout"},
+		{Key: "idle_timeout", Category: "server", Label: "Idle timeout",
+			Help: "Keep-alive idle connections. No write timeout (it would kill SSE). Restart required.",
+			Kind: KindDuration, HotReload: false, Min: num(0), ZeroMeans: "no timeout"},
+		{Key: "go_memory_limit", Category: "server", Label: "Go memory limit",
+			Help: "Soft cap on Go runtime managed memory (heap, stacks, runtime), applied once at startup. 0 auto-detects a finite cgroup memory ceiling at 80% (ceilings below 80MiB are ignored) and otherwise leaves the runtime unbounded. GOMEMLIMIT wins when set; GOGC is independent. A set value overrides GOMEMLIMIT, not GOGC. Exceeding it turns the collector more aggressive (capped near 50% CPU), never fails requests. Does not bound SQLite's page cache or OS overhead. Restart required.",
+			Kind: KindBytes, HotReload: false, Min: num(float64(MemoryLimitMin)), Max: num(float64(MemoryLimitMax)), ZeroMeans: "auto cgroup, else unbounded"},
+
+		// ---- request ----
+		{Key: "max_request_bytes", Category: "request", Label: "Max request bytes",
+			Help: "Inbound body the proxy will buffer to read routing metadata. Larger bodies are rejected with 413.",
+			Kind: KindBytes, HotReload: true, Min: num(MaxRequestBytesMin), Max: num(MaxRequestBytesMax)},
+		{Key: "allowed_base_urls", Category: "request", Label: "Allowed base URLs",
+			Help: "SSRF allowlist of upstream base-URL prefixes. Empty allows any target (single trusted operator). Each entry must be an absolute http:// or https:// URL with a host.",
+			Kind: KindStrings, HotReload: true},
+		{Key: "capture_body_preview", Category: "request", Label: "Capture body preview",
+			Help: "Store a short bounded preview of the last user prompt / response in metrics. Off by default so content is not persisted.",
+			Kind: KindBool, HotReload: true},
+		{Key: "debug_capture_ttl", Category: "request", Label: "Debug capture TTL",
+			Help: "How long a full debug capture (bodies and headers) is kept after the request finishes. Operator debug sessions choose which traffic is captured; this is blob retention, not the session timer.",
+			Kind: KindDuration, HotReload: true, Min: num(float64(DebugCaptureTTLMin)), Max: num(float64(DebugCaptureTTLMax))},
+		{Key: "debug_capture_max_bytes", Category: "request", Label: "Debug capture max bytes",
+			Help: "Cap on one debug capture (request body plus client-facing response bytes). Past the cap the rest is dropped and the capture is marked truncated.",
+			Kind: KindBytes, HotReload: true, Min: num(float64(DebugCaptureMaxBytesMin)), Max: num(float64(DebugCaptureMaxBytesMax))},
+		{Key: "debug_store_max_bytes", Category: "request", Label: "Debug store max bytes",
+			Help: "Total durable debug-capture sidecar cap. New captures are skipped once the next write would exceed it; TTL expiry frees capacity. Bytes, not characters. 0 = unlimited. Restart required.",
+			Kind: KindBytes, Min: num(float64(DebugStoreMaxBytesMin)), Max: num(float64(DebugStoreMaxBytesMax)), ZeroMeans: "unlimited"},
+		{Key: "auto_token_refresh", Category: "request", Label: "Auto token refresh",
+			Help: "Exchange an expired or expiring JWT when the client sends X-Proxy-Refresh-Token. All supported providers use inference handback: HTTP 401 with token_expired and access_token in the error body, plus refresh_token only when the exchange returns a different replacement. No inference is sent; adopt the returned credentials and retry, retaining the old refresh token if no replacement is returned. Model discovery refreshes transparently without returning tokens. Stateless: no reusable credentials are retained.",
+			Kind: KindBool, HotReload: true},
+
+		// ---- upstream ----
+		{Key: "upstream_timeout", Category: "upstream", Label: "Upstream header timeout",
+			Help: "How long to wait for upstream response headers. Streaming bodies are not subject to this. Transient header timeouts are retried.",
+			Kind: KindDuration, HotReload: true, Min: num(0), ZeroMeans: "no header cap"},
+		{Key: "models_discovery_timeout", Category: "upstream", Label: "Model discovery timeout",
+			Help: "One upstream metadata budget for transparent key refresh, all model pages and optional enrichment. Never applies to LLM streams. New discoveries use reloaded limits.",
+			Kind: KindDuration, HotReload: true, Min: num(float64(ModelsDiscoveryTimeoutMin)), Max: num(float64(ModelsDiscoveryTimeoutMax))},
+		{Key: "models_discovery_max_bytes", Category: "upstream", Label: "Model discovery bytes",
+			Help: "Aggregate response bytes read after transport decoding across model pages, unary RPCs and enrichment. Primary overflow fails; optional enrichment is discarded. This is not a strict heap limit.",
+			Kind: KindBytes, HotReload: true, Min: num(ModelsDiscoveryMaxBytesMin), Max: num(ModelsDiscoveryMaxBytesMax)},
+		{Key: "models_discovery_max_pages", Category: "upstream", Label: "Model discovery pages",
+			Help: "Maximum upstream model responses per discovery, including a unary RPC and optional enrichment. Limits are captured once, never reset between pages.",
+			Kind: KindInt, HotReload: true, Min: num(ModelsDiscoveryMaxPagesMin), Max: num(ModelsDiscoveryMaxPagesMax)},
+		{Key: "max_conns_per_host", Category: "upstream", Label: "Max conns per host",
+			Help: "Total connections per upstream host. Sized for concurrent SSE streams, not requests/sec.",
+			Kind: KindInt, HotReload: true, Min: num(0), ZeroMeans: "unlimited"},
+		{Key: "max_idle_conns", Category: "upstream", Label: "Max idle conns",
+			Help: "Process-wide idle connection pool.",
+			Kind: KindInt, HotReload: true, Min: num(0), ZeroMeans: "unlimited"},
+		{Key: "max_idle_conns_per_host", Category: "upstream", Label: "Max idle conns per host",
+			Help: "Idle connections kept per upstream host. Cannot exceed max conns per host when that is set. net/http treats 0 as a default of 2, not unlimited, so this must be >= 1.",
+			Kind: KindInt, HotReload: true, Min: num(1)},
+		{Key: "idle_conn_timeout", Category: "upstream", Label: "Idle conn timeout",
+			Help: "How long an idle upstream connection is kept before closing.",
+			Kind: KindDuration, HotReload: true, Min: num(0), ZeroMeans: "never expire"},
+		{Key: "sse_keepalive_interval", Category: "upstream", Label: "SSE keepalive interval",
+			Help: "How often a quiet streaming socket gets a `: keepalive` comment (queue wait, operator hold, TTFB, mid-stream gaps). Range " + heartbeatRange() + ". Applies to streams started after reload.",
+			Kind: KindDuration, HotReload: true, Min: num(float64(HeartbeatIntervalMin)), Max: num(float64(HeartbeatIntervalMax))},
+
+		// ---- queue ----
+		{Key: "max_concurrent", Category: "queue", Label: "Max concurrent",
+			Help: "In-flight sends per provider+key. 0 is unlimited.",
+			Kind: KindInt, HotReload: true, Min: num(0), ZeroMeans: "unlimited"},
+		{Key: "max_queue_size", Category: "queue", Label: "Max queue size",
+			Help: "Queued waiters per group. 0 is unlimited. It also feeds the default queue cap of a new pause hold.",
+			Kind: KindInt, HotReload: true, Min: num(0), ZeroMeans: "unlimited"},
+		{Key: "max_inflight_requests", Category: "queue", Label: "Max in-flight requests",
+			Help: "Process-wide inference admission bound. Requests above it are refused with 503 and Retry-After instead of buffering their bodies. 0 = unlimited. Hot-reloads.",
+			Kind: KindInt, HotReload: true, Min: num(0), Max: num(1_000_000)},
+		{Key: "max_inflight_body_bytes", Category: "queue", Label: "Max in-flight body bytes",
+			Help: "Process-wide budget for buffered inbound request bodies. Admission reserves the declared Content-Length, or the request-body cap for chunked bodies, and refuses with 503 before reading when the budget would be exceeded. 0 = unlimited. Hot-reloads.", Kind: KindBytes, HotReload: true, Min: num(float64(MaxInflightBodyBytesMin)), Max: num(float64(MaxInflightBodyBytesMax)), ZeroMeans: "unlimited"},
+		{Key: "max_inflight_response_bytes", Category: "queue", Label: "Max in-flight response bytes",
+			Help: "Process-wide budget for buffered upstream response bodies: whole-document translation of non-streaming responses, the non-streaming 200 quality spool (at most 1 MiB plus one 32 KiB chunk), and model discovery. Admission reserves the declared Content-Length when it fits the bounded read cap, otherwise that cap, and refuses with 503 and Retry-After before reading when the budget would be exceeded. The reservation is released once the buffer is written, translated, or abandoned. 0 = unlimited. Hot-reloads.", Kind: KindBytes, HotReload: true, Min: num(float64(MaxInflightResponseBytesMin)), Max: num(float64(MaxInflightResponseBytesMax)), ZeroMeans: "unlimited"},
+		{Key: "max_queue_wait", Category: "queue", Label: "Max queue wait",
+			Help: "How long a request may sit in the queue before 429. " + FormatDuration(0) + " is unlimited. Operator-hold time is excluded.",
+			Kind: KindDuration, HotReload: true, Min: num(0), ZeroMeans: "unlimited"},
+		{Key: "max_retries", Category: "queue", Label: "Max retries",
+			Help: "Transparent retries of transient 429 / 5xx / transport failures. Durable quota 429s follow quota_pause_mode instead of this budget.",
+			Kind: KindInt, HotReload: true, Min: num(0), ZeroMeans: "no retries"},
+		{Key: "queue_retry_after", Category: "queue", Label: "Queue Retry-After",
+			Help: "Retry-After hint sent when our own queue is full or the wait is exceeded. HTTP Retry-After is integer seconds, so the value must be a whole number of seconds.",
+			Kind: KindDuration, HotReload: true, Min: num(0), Max: num(float64(QueueRetryAfterMax))},
+		{Key: "base_backoff", Category: "queue", Label: "Base backoff",
+			Help: "Initial adaptive delay. Doubles each attempt and each consecutive failed request, up to max backoff. A provider Retry-After/reset is a floor (never retry sooner) and does not reset this doubling. Cannot exceed max backoff. Must be > 0.",
+			Kind: KindDuration, HotReload: true},
+		{Key: "max_backoff", Category: "queue", Label: "Max backoff",
+			Help: "Cap on adaptive backoff. Does not clamp a provider Retry-After / rate-limit-reset (daily limits are often 30–60m). Must be > 0.",
+			Kind: KindDuration, HotReload: true},
+		{Key: "quality_retries", Category: "queue", Label: "Quality retries",
+			Help: "Transparent re-attempts of a degenerate 200 (empty completion, empty tool_calls), a truncated stream that relayed no content yet, a retryable in-band provider error dropped before the wire, and Cursor's empty-resume re-ask. 0 disables.",
+			Kind: KindInt, HotReload: true, Min: num(0), Max: num(QualityRetriesMax), ZeroMeans: "disabled"},
+		{Key: "thinking_retries", Category: "queue", Label: "Thinking retries",
+			Help: "Transparent rescue of requests that die or end without an answer during thinking: a stream truncated or reset after reasoning-only output, a cleanly finished reasoning-only completion, a retryable in-band provider error that arrived after reasoning-only output, and a non-streaming reasoning-only body. The fresh attempt appends after the relayed reasoning; answer content and tool calls are never rescued, and finish_reason length never is. Each rescue re-sends the full request (billed). 0 disables.",
+			Kind: KindInt, HotReload: true, Min: num(0), Max: num(ThinkingRetriesMax), ZeroMeans: "disabled"},
+		{Key: "retryable_error_classes", Category: "queue", Label: "Retryable error classes",
+			Help: "Operator extensions to the built-in retryable in-band error vocabulary: exact type or code strings (case-insensitive) that a provider reports inside a 200 and that authorize a transparent re-send while no generation content was relayed. Built-ins already cover server_error, the 503 overloaded/unavailable family, api_error, overloaded_error, timeout_error and common gateway spellings; list custom gateway spellings here. Durable quota/billing classes are rejected at load; in-band rate limits, unknown classes and errors after relayed content stay verbatim. Reload applies to new rescue decisions.",
+			Kind: KindStrings, HotReload: true},
+		{Key: "suppress_client_retries", Category: "queue", Label: "Suppress client retries",
+			Help: "Make the proxy the clients' sole retry authority: stamp x-should-retry: false on every LLM-relay error response. The official OpenAI SDKs (python/node/go/ruby) honor it over their 408/409/429/5xx auto-retry and over Retry-After, including relayed provider hints; the proxy's own retry ladder has already run by then. Cannot suppress transport-level failures, and clients that ignore the header (the Vercel AI SDK / opencode stack) keep their own policy.",
+			Kind: KindBool, HotReload: true},
+
+		// ---- storm ----
+		{Key: "storm_enabled", Category: "storm", Label: "Enable protection",
+			Help: "Detect elevated upstream failure rates and queue affected sends for bounded recovery probes. Opt-in; requests can still fail on cancellation, exhausted retry budgets, queue limits or permanent errors. Retries can repeat upstream execution and billing.",
+			Kind: KindBool, HotReload: true},
+		{Key: "storm_provider_enabled", Category: "storm", Label: "Provider protection",
+			Help: "Gate every model on a provider only when all active models individually meet the sample and failure thresholds. Active means a request in the same detection window; idle models expire.",
+			Kind: KindBool, HotReload: true},
+		{Key: "storm_model_enabled", Category: "storm", Label: "Model protection",
+			Help: "Gate an affected exact recorded model name within its provider. Dashboard model grouping does not broaden this scope.",
+			Kind: KindBool, HotReload: true},
+		{Key: "storm_banner_enabled", Category: "storm", Label: "Show incident banner",
+			Help: "Show affected providers/models, safe error categories, failure percentages, queue state and recovery timing at the top of the dashboard. Changing visibility does not reset protection.",
+			Kind: KindBool, HotReload: true},
+		{Key: "storm_window", Category: "storm", Label: "Detection window",
+			Help: "Rolling time range for successful and eligible failed upstream attempts. Models with no requests in this window expire from provider-wide checks.",
+			Kind: KindDuration, HotReload: true, Min: num(float64(time.Second)), Max: num(float64(time.Hour))},
+		{Key: "storm_min_samples", Category: "storm", Label: "Minimum samples",
+			Help: "Minimum successful or eligible failed upstream attempts in the detection window before a model qualifies. Provider-wide protection requires every active model to qualify. Retries count as separate attempts; this is not a distinct-request percentage.",
+			Kind: KindInt, HotReload: true, Min: num(1), Max: num(1_000_000)},
+		{Key: "storm_error_percent", Category: "storm", Label: "Failure threshold",
+			Help: "Minimum percentage of sampled upstream attempts with a selected failure. Applied to each exact model after the minimum sample count; all active models must qualify for provider-wide protection.",
+			Kind: KindInt, HotReload: true, Min: num(1), Max: num(100), Unit: "percent"},
+		{Key: "storm_initial_backoff", Category: "storm", Label: "Initial recovery delay",
+			Help: "Initial storm cooldown before a recovery probe. Cannot exceed maximum recovery delay. Valid upstream Retry-After/reset hints still apply independently.",
+			Kind: KindDuration, HotReload: true, Min: num(float64(time.Millisecond)), Max: num(float64(time.Hour))},
+		{Key: "storm_max_backoff", Category: "storm", Label: "Maximum recovery delay",
+			Help: "Cap on exponentially increased storm cooldowns. Must be at least initial recovery delay. Does not shorten upstream Retry-After/reset hints.",
+			Kind: KindDuration, HotReload: true, Min: num(float64(time.Millisecond)), Max: num(float64(time.Hour))},
+		{Key: "storm_backoff_multiplier", Category: "storm", Label: "Recovery delay multiplier",
+			Help: "Multiply the storm cooldown after a failed recovery probe, up to maximum recovery delay.",
+			Kind: KindInt, HotReload: true, Min: num(2), Max: num(10)},
+		{Key: "storm_jitter_percent", Category: "storm", Label: "Recovery delay jitter",
+			Help: "Random spread as a percentage of the storm cooldown to separate recovery attempts. 0 disables jitter.",
+			Kind: KindInt, HotReload: true, Min: num(0), Max: num(100), ZeroMeans: "no jitter", Unit: "percent"},
+		{Key: "storm_recovery_successes", Category: "storm", Label: "Recovery successes",
+			Help: "Consecutive successful recovery probes required before queued traffic resumes normally.",
+			Kind: KindInt, HotReload: true, Min: num(1), Max: num(100)},
+		{Key: "storm_max_queue", Category: "storm", Label: "Maximum queued requests",
+			Help: "Maximum requests waiting for storm recovery. Excess work is rejected locally; requests and their bounded bodies stay in process memory while waiting.",
+			Kind: KindInt, HotReload: true, Min: num(1), Max: num(100000)},
+		{Key: "storm_max_wait", Category: "storm", Label: "Maximum queue wait",
+			Help: "Maximum duration of each storm gate wait, not total request duration across all retries and other queues. Caller cancellation may end the wait earlier.",
+			Kind: KindDuration, HotReload: true, Min: num(float64(time.Millisecond)), Max: num(float64(24 * time.Hour))},
+		{Key: "storm_max_scopes", Category: "storm", Label: "Maximum tracked scopes",
+			Help: "Bound on provider and exact-model detector scopes retained in process memory. Increasing it does not establish a total process memory ceiling.",
+			Kind: KindInt, HotReload: true, Min: num(2), Max: num(100000)},
+		{Key: "storm_max_retries", Category: "storm", Label: "Additional storm retries",
+			Help: "Additional retries beyond max_retries only while a relevant storm is active and the failure matches a selected eligible transient condition. Does not replay meaningful emitted upstream content. 0 keeps the ordinary retry budget.",
+			Kind: KindInt, HotReload: true, Min: num(0), Max: num(1000), ZeroMeans: "no additional retries"},
+		{Key: "storm_status_codes", Category: "storm", Label: "HTTP failure statuses",
+			Help: "Exact status strings selected for detection and additional storm retries: 429 or 500..599, without duplicates. Empty disables HTTP status triggers. 429 is opt-in because limits may be credential-specific; durable quota/billing 429s remain excluded from storm evidence (quota_pause_mode owns their reaction).",
+			Kind: KindStrings, HotReload: true},
+		{Key: "storm_transport_errors", Category: "storm", Label: "Transient transport failures",
+			Help: "Include transport failures already eligible for the shared retry policy. Caller cancellation and permanent transport errors are excluded.",
+			Kind: KindBool, HotReload: true},
+		{Key: "storm_stream_errors", Category: "storm", Label: "Response and stream failures",
+			Help: "Include recorded in-band, stream and quality failures to protect future sends. Reports a generic response error without retaining error bodies for the banner. Never replays meaningful emitted upstream content.",
+			Kind: KindBool, HotReload: true},
+
+		// ---- quota ----
+		{Key: "quota_pause_mode", Category: "quota", Label: "Mode",
+			Help: "Reaction to a 429 carrying a durable quota/billing error (insufficient_quota/credits, spend limits; in-band occurrences included): off surfaces it immediately; retry opens a provider-wide recovery gate - the triggering request absorbs the 429 and re-sends per the storm recovery delays, new requests park on the gate (bounded by storm_max_queue/storm_max_wait), and the first 2xx closes it; manual creates an indefinite provider pause that only an operator resumes. Classification is fixed; only the reaction is configurable.",
+			Kind: KindString, HotReload: true},
+		{Key: "quota_pause_recovery_successes", Category: "quota", Label: "Recovery successes",
+			Help: "Consecutive successful recovery probes that close a retry-mode quota gate. 1 releases the queue on the first 2xx. Meaningful only in retry mode.",
+			Kind: KindInt, HotReload: true, Min: num(1), Max: num(100)},
+
+		// ---- conversation ----
+		{Key: "conversation_idle_gap", Category: "conversation", Label: "Idle gap",
+			Help: "A gap longer than this starts a new conversation for the same client+key. Generous so thinking pauses inside one task don't split it. Must be > 0.",
+			Kind: KindDuration, HotReload: true},
+		{Key: "conversation_max_open", Category: "conversation", Label: "Max open",
+			Help: "Cap on concurrently-open conversations per client+key. Oldest is evicted past it.",
+			Kind: KindInt, HotReload: true, Min: num(1), Max: num(100000)},
+		{Key: "sub_conversations", Category: "conversation", Label: "Sub-conversation tracking",
+			Help: "Per-client tracking of a request body field that carries a sub-conversation identity, exemplified by opencode's promptCacheKey. Each entry names one classified client exactly (no wildcard, no case folding) plus 1..4 exact JSON field names matched only at the request body's top level; the first present field decides (duplicate top-level keys resolve by their first occurrence): a present value that is not a JSON string value counts as absent and the next field is checked, while a present string that cannot be decoded or fails the identity rules (non-empty after trimming, valid UTF-8, free of control bytes, at most 512 bytes) drops the identity for the request - no later field is consulted - and a dropped identity is never a client error. The drop is conservative: a value whose raw spelling exceeds the bounded scan window is dropped even when its trimmed form would pass. The value groups the request under a k: conversation identity, after the X-Proxy-Session header (s:) and before automatic client+key grouping; X-Proxy-Parent-Session still owns parent linkage. Requests translated to the Anthropic wire gain a top-level prompt_cache_key carrying the value. strip: true removes the entry's configured fields from the top level of the relayed upstream passthrough body; the default false forwards the body unchanged. Param names are exact printable-ASCII JSON key segments up to 64 bytes, no quotes or backslashes; duplicate clients and duplicate params within an entry are rejected. Caps: 16 entries, 4 params per entry. Default: an empty list, tracking fully off. Hot-reloads.",
+			Kind: KindSubConversations, HotReload: true},
+
+		// ---- format ----
+		{Key: "anthropic_default_max_tokens", Category: "format", Label: "Anthropic default max tokens",
+			Help: "Injected into translated Anthropic requests when the client sent neither max_tokens nor max_completion_tokens.",
+			Kind: KindInt, HotReload: true, Min: num(1), Max: num(1_000_000), Unit: "tokens"},
+		{Key: "cursor_default_context_window", Category: "format", Label: "Cursor default context window",
+			Help: "Optional context-window hint stamped onto every model in GET /v1/models when X-Proxy-Format is cursor. 0 omits the field.",
+			Kind: KindInt, HotReload: true, Min: num(0), ZeroMeans: "omit (client default)", Unit: "tokens"},
+		{Key: "cursor_park_ttl", Category: "format", Label: "Cursor park TTL",
+			Help: "How long a parked Cursor Run stream stays open waiting for tool results. Must be > 0. Expiry closes the stream; the next continuation cold-starts.",
+			Kind: KindDuration, HotReload: true},
+		{Key: "cursor_heartbeat_interval", Category: "format", Label: "Cursor heartbeat",
+			Help: "How often the proxy pings a Cursor agent.v1 run (idle parked runs included). Range " + heartbeatRange() + ". Applies to runs created after reload.",
+			Kind: KindDuration, HotReload: true, Min: num(float64(HeartbeatIntervalMin)), Max: num(float64(HeartbeatIntervalMax))},
+
+		// ---- storage ----
+		{Key: "storage_write_chan_cap", Category: "storage", Label: "Write channel cap",
+			Help: "Buffered records before overflow drops. Restart required.",
+			Kind: KindInt, HotReload: false, Min: num(1), Max: num(1_000_000)},
+		{Key: "storage_batch_cap", Category: "storage", Label: "Batch cap",
+			Help: "Max records per SQLite transaction. Cannot exceed the write channel cap. Restart required.",
+			Kind: KindInt, HotReload: false, Min: num(1)},
+		{Key: "storage_flush_interval", Category: "storage", Label: "Flush interval",
+			Help: "Partial-batch flush cadence. Must be > 0 (a zero ticker panics). Restart required.",
+			Kind: KindDuration, HotReload: false},
+		{Key: "storage_query_timeout", Category: "storage", Label: "Query timeout",
+			Help: "Bounds dashboard SELECT queries. Must be > 0. Open and AggAPI bind at start (restart required); pause/throttle persist reads the live snapshot.",
+			Kind: KindDuration, HotReload: false},
+		{Key: "storage_query_max_bytes", Category: "storage", Label: "Query result bytes",
+			Help: "Maximum JSON bytes returned by /metrics/query; also bounds SQLite string/blob values. Oversized results fail with HTTP 413, never truncate. Does not cap all SQLite working memory. Restart required.",
+			Kind: KindBytes, HotReload: false, Min: num(StorageQueryMaxBytesMin), Max: num(StorageQueryMaxBytesMax)},
+		{Key: "storage_query_max_rows", Category: "storage", Label: "Query result rows",
+			Help: "Maximum rows returned by /metrics/query. Oversized results fail with HTTP 413; use SQL filters or LIMIT. Does not limit dashboard aggregates or exports. Restart required.",
+			Kind: KindInt, HotReload: false, Min: num(StorageQueryMaxRowsMin), Max: num(StorageQueryMaxRowsMax)},
+		{Key: "backup_max_bytes", Category: "backup", Label: "Backup size cap",
+			Help: "Maximum size of one Settings backup download or restore upload. Larger archives are refused. Downloads and restores stream through private staging files; this is the admit/reject ceiling, not a heap guarantee.",
+			Kind: KindBytes, HotReload: true, Min: num(float64(BackupMaxBytesMin)), Max: num(float64(BackupMaxBytesMax))},
+
+		// ---- mcp ----
+		{Key: "mcp_enabled", Category: "mcp", Label: "Enable MCP endpoint",
+			Help: "Register the streamable HTTP MCP endpoint at /mcp for LLM tool clients, operator-gated and Bearer-only like /metrics. Off keeps the route reserved (404, never inference); the /mcp/ look-alike reservation and the operator gate stay either way. Restart required.",
+			Kind: KindBool, HotReload: false},
+		{Key: "mcp_page_size", Category: "mcp", Label: "Page size",
+			Help: "Default page for the records, values and audit capture listings the endpoint serves to a model. Restart required.",
+			Kind: KindInt, HotReload: false, Min: num(MCPPageSizeMin), Max: num(MCPPageSizeMax)},
+		{Key: "mcp_query_max_rows", Category: "mcp", Label: "Query result rows",
+			Help: "Default client-side row limit when a query call omits max_rows. An explicit max_rows may raise it up to this setting's maximum; the proxy's own storage_query_max_rows still answers 413 first. Restart required.",
+			Kind: KindInt, HotReload: false, Min: num(MCPQueryMaxRowsMin), Max: num(MCPQueryMaxRowsMax)},
+		{Key: "mcp_query_max_bytes", Category: "mcp", Label: "Query result bytes",
+			Help: "Client-side cap on the encoded size of one query tool result. Keeps whole rows, truncating with an explicit marker rather than silently. Restart required.",
+			Kind: KindBytes, HotReload: false, Min: num(MCPQueryMaxBytesMin)},
+		{Key: "mcp_capture_max_bytes", Category: "mcp", Label: "Capture max bytes",
+			Help: "Size above which a stored capture document is withheld whole from the audit_capture_get tool; a document that large is more than a model should read in one call. Restart required.",
+			Kind: KindBytes, HotReload: false, Min: num(MCPCaptureMaxBytesMin)},
+		{Key: "mcp_query_timeout", Category: "mcp", Label: "Query timeout",
+			Help: "Bounds one proxy read the endpoint makes that is not the proxy's own bounded SQL reader (a full-history chart or explorer fold can take seconds). Must be > 0. Restart required.",
+			Kind: KindDuration, HotReload: false},
+		{Key: "mcp_timeout", Category: "mcp", Label: "Request timeout",
+			Help: "Bounds every in-process call the endpoint's tools make to the proxy, including mutations. Must be > 0. Restart required.",
+			Kind: KindDuration, HotReload: false},
+
+		// ---- dashboard ----
+		{Key: "dash_log_rows", Category: "dashboard", Label: "Request log rows",
+			Help: "Page size of the live request log (newest first). Scrolling near the bottom loads more, including older durable history.",
+			Kind: KindInt, HotReload: true, Min: num(DashLogRowsMin), Max: num(DashLogRowsMax)},
+		{Key: "dash_poll_interval", Category: "dashboard", Label: "Poll interval",
+			Help: "KPI / pause / SSE-fallback poll cadence. Must be > 0.",
+			Kind: KindDuration, HotReload: true},
+		{Key: "dash_chart_refresh", Category: "dashboard", Label: "Chart refresh",
+			Help: "How often the traffic chart re-fetches server-authoritative buckets and period totals. Must be > 0.",
+			Kind: KindDuration, HotReload: true},
+		{Key: "dash_explorer_stale", Category: "dashboard", Label: "Explorer stale after",
+			Help: "How old a cached explorer breakdown may be before it is re-fetched. Must be > 0.",
+			Kind: KindDuration, HotReload: true},
+		{Key: "dash_background_refresh", Category: "dashboard", Label: "Background refresh",
+			Help: "Keep the dashboard current while its tab is hidden: the poll runs at the browser's throttled background cadence (about one wake per minute on Chromium) and a Web Lock keeps the SSE feed from being frozen. Desktop Chromium only; Android and iOS still suspend background pages at the OS level. Off keeps the current pause-while-hidden behavior.",
+			Kind: KindBool, HotReload: true},
+
+		// ---- providers ----
+		{Key: "providers", Category: "providers", Label: "Provider field maps",
+			Help: "Per-provider cost/usage JSON field paths, optional models_path/models_keys enrichment, ensured tool names and headers (a string map). Field names only, never static prices. Custom cost_keys must report USD; leave cost_in_usd_ticks to automatic unit conversion. ensure_tools names function tools injected as inert stubs into relayed OpenAI-wire chat bodies missing them, with tool_choice none added when the client sent no tools, so a first-party client's tool-signature gate still recognizes the request. Header values expand {{uuid4}} to a fresh UUID, {{platform}} to the server's Rust-style os; arch pair, and {{opencode-msg-id}}/{{opencode-ses-id}} to fresh opencode-format identifiers; unknown templates stay literal. On HTTP relay requests, configured headers override forwarded/extracted-auth values and X-Proxy-Headers wins. Model discovery and the Cursor bridge construct headers separately and do not apply X-Proxy-Headers. Headers can contain secrets; keep runtime configuration private.",
+			Kind: KindProviders, HotReload: true},
+		{Key: "provider_aliases", Category: "providers", Label: "Provider aliases",
+			Help: "Map an old provider label to a canonical label. Rewrites existing stored history at boot and on reload; new requests use the canonical label. Existing in-memory records keep their prior label until they age out or the process restarts. Removing a mapping does not restore rewritten history. Chains and self-maps are rejected.",
+			Kind: KindAliases, HotReload: true},
+		// ---- models ----
+		{Key: "model_rules", Category: "models", Label: "Model grouping rules",
+			Help: "Ordered rewrite pipeline that merges spelling variants of the same model in every grouped surface (explorer model dimension, scope filters, debug checklist, Clear/Logs optgroups, and the request-log leaf\u2019s displayed name). Each rule is one step: exact (whole-string merge old → new), pattern (regex rewrite of all occurrences, $1 capture refs), lower (fold case). Rules apply once in order; the shipped default folds case, strips a `vendor/` namespace, strips a trailing `:tag`, strips a trailing architecture/quant suffix (`-fp4`, `-nvfp4`, `-bf16`, `-int8`, `-q4_k_m`), and unifies `.` with `-` between digits. An explicitly empty list groups by the exact stored spelling. Stored values remain unchanged; purge/export match them exactly and request details show the original. Debug matching uses separate native base-model normalization, not these display rules. Hot-reloads.",
+			Kind: KindModelRules, HotReload: true},
+		// ---- overrides ----
+		{Key: "request_overrides", Category: "overrides", Label: "Request override rules",
+			Help: "Ordered rules that rewrite the upstream request before relay. A rule matches when every non-empty scope field equals the request's value exactly: client as the classified client, provider as the canonical label after provider_aliases, model as the recorded model id; an empty scope field matches anything. All matching rules apply in list order, and for the same header or body field the later rule wins. headers sets or replaces upstream headers (names are canonicalized, values must be non-empty single-line), remove_headers deletes them, and body sets max_tokens / max_completion_tokens (1..1000000) on the OpenAI wire. Credential and protocol headers (such as authorization, cookie, host, content-type, and the whole x-proxy- control prefix) are rejected at load. The override applies after provider headers and the client's X-Proxy-Headers map and wins over both; it covers inference sends only, never model discovery or token refresh. Body rewrites apply to passthrough and translated-anthropic requests and re-stamp the recorded request cap; the Cursor bridge reads no body fields, so body is skipped for cursor targets while header rules still apply. An empty list leaves every request untouched. Hot-reloads.",
+			Kind: KindRequestOverrides, HotReload: true},
+		// ---- plugins ----
+		{Key: "plugins_enabled", Category: "plugins", Label: "Load rule packs",
+			Help: "Load YAML rule packs from plugin_dir at boot and on reload. Each pack may contribute only provider_aliases, model_rules, providers, request_overrides and sub_conversations; any other key, oversized file, or invalid merged config fails closed. Rules append in filename order and all existing caps still apply. Restart required.",
+			Kind: KindBool, HotReload: false},
+		{Key: "plugin_dir", Category: "plugins", Label: "Rule pack directory",
+			Help: "Directory of direct .yaml/.yml rule packs, read in sorted filename order. Empty disables loading. Files are size-capped and must be regular files; symlinks and unknown keys are refused. Restart required.",
+			Kind: KindString, HotReload: false},
+		{Key: "plugin_credentials_file", Category: "plugins", Label: "Scoped plugin credentials",
+			Help: "Optional JSON file of SHA-256 token digests and capability scopes for plugin clients. Raw tokens are never stored here and are excluded from config backups. Empty disables scoped credentials; only the full operator token is accepted. Restart required.",
+			Kind: KindString, HotReload: false},
+		{Key: "plugin_trust_file", Category: "plugins", Label: "Trusted plugin signers",
+			Help: "Optional JSON file of Ed25519 public keys keyed by signer id. Empty permits unsigned development manifests; when set, every plugin manifest must carry a valid signer and signature. Restart required.",
+			Kind: KindString, HotReload: false},
+		{Key: "plugin_lock_file", Category: "plugins", Label: "Plugin digest pins",
+			Help: "Optional JSON file pinning module filenames to SHA-256 digests. A pinned module with a changed digest fails boot until pins are refreshed through /admin/plugins. Restart required for pin changes to load.",
+			Kind: KindString, HotReload: false},
+		{Key: "plugin_inbox_dir", Category: "plugins", Label: "Plugin inbox directory",
+			Help: "Optional directory of .mvplugin files scanned on demand by the operator install route. Empty disables inbox scanning. Files are size-capped and must be regular files; symlinks are refused. Restart required.",
+			Kind: KindString, HotReload: false},
+		{Key: "plugin_downloads_enabled", Category: "plugins", Label: "Allow plugin downloads",
+			Help: "Permit the operator install and update routes to fetch signed plugins from allowlisted GitHub release URLs. Remote plugin sources are refused while false. Restart required.",
+			Kind: KindBool, HotReload: false},
+		{Key: "plugin_http_allow_hosts", Category: "plugins", Label: "Plugin HTTP fetch hosts",
+			Help: "Exact host[:port] allowlist for the generic http:fetch plugin capability. Empty disables all outbound guest fetches. Guests never receive credentials; the host enforces this allowlist, GET-only methods, a 5s timeout, and a 64 KiB response cap. Restart required.",
+			Kind: KindStrings, HotReload: false},
+	})
+})
+
+// Schema is the single registry of every user-tunable. Adding a Config field
+// requires an entry here; TestSchemaCoversConfigFields fails if they drift.
+// The slice is built once and shared by every caller: never mutate it or its
+// elements. Callers needing a private copy make one themselves.
+func Schema() []Field {
+	return schemaRegistry()
+}
+
+func withZeroTokens(fields []Field) []Field {
+	for i := range fields {
+		switch fields[i].Kind {
+		case KindDuration:
+			fields[i].ZeroToken = FormatDuration(0)
+		case KindBytes:
+			fields[i].ZeroToken = FormatByteSize(0)
+		}
+	}
+	return fields
+}
+
+// FieldByKey returns the schema entry for a yaml key, or nil. It scans the
+// shared registry once and returns a pointer to a copy of the entry, so a
+// caller can never mutate the cached schema through it.
+func FieldByKey(key string) *Field {
+	fields := Schema()
+	for i := range fields {
+		if fields[i].Key == key {
+			f := fields[i]
+			return &f
+		}
+	}
+	return nil
+}
+
+// errUnknownKey rejects a key that is not in the schema: the single wording
+// owner shared by Apply (Settings POST) and the YAML overlay path.
+func errUnknownKey(key string) error {
+	return fmt.Errorf("unknown config key %q", key)
+}
+
+// TypeLine is the "type · range · default" annotation written into YAML
+// comments via WriteYAML (Settings Apply). Not rendered in the Settings form.
+func (f Field) TypeLine(def any) string {
+	var b strings.Builder
+	b.WriteString("type: ")
+	switch f.Kind {
+	case KindString:
+		b.WriteString("string")
+	case KindInt:
+		b.WriteString("int")
+	case KindBytes:
+		b.WriteString("bytes")
+	case KindBool:
+		b.WriteString("bool")
+	case KindDuration:
+		b.WriteString("duration")
+	case KindStrings:
+		b.WriteString("list of string")
+	case KindProviders:
+		b.WriteString("map of provider label → {cost_keys, usage_keys, models_path, models_keys, ensure_tools, headers}")
+	case KindAliases:
+		b.WriteString("map of old provider label → canonical label")
+	case KindModelRules:
+		b.WriteString("ordered list of {mode: exact|pattern|lower, from, to} rewrite rules")
+	case KindRequestOverrides:
+		b.WriteString("ordered list of {client, provider, model, headers, remove_headers, body} upstream rewrite rules")
+	case KindSubConversations:
+		b.WriteString("ordered list of {client, params, strip} per-client tracked body params")
+	default:
+		b.WriteString(string(f.Kind))
+	}
+	// KindBytes already writes "bytes"; KindInt appends Unit (tokens, percent).
+	if f.Kind == KindInt && f.Unit != "" {
+		b.WriteString(" (" + f.Unit + ")")
+	}
+	if f.Min != nil || f.Max != nil || f.ZeroMeans != "" {
+		b.WriteString(" · range ")
+		switch {
+		case f.Min != nil && f.Max != nil:
+			b.WriteString(fmt.Sprintf("%s..%s", f.formatBound(*f.Min), f.formatBound(*f.Max)))
+		case f.Min != nil:
+			b.WriteString(">= " + f.formatBound(*f.Min))
+		case f.Max != nil:
+			b.WriteString("<= " + f.formatBound(*f.Max))
+		}
+		if f.ZeroMeans != "" {
+			zero := "0"
+			if f.ZeroToken != "" {
+				zero = f.ZeroToken
+			}
+			if f.Min != nil || f.Max != nil {
+				b.WriteString(" (" + zero + " = " + f.ZeroMeans + ")")
+			} else {
+				b.WriteString(zero + " = " + f.ZeroMeans)
+			}
+		}
+	}
+	if f.Kind == KindDuration && f.Min == nil && f.Max == nil && f.ZeroMeans == "" {
+		b.WriteString(" · range > " + FormatDuration(0))
+	}
+	switch {
+	case f.Kind == KindModelRules:
+		// fmt.Sprint of a []ModelRule would dump Go struct literals
+		// ("{lower   false}") - describe the shipped pipeline instead.
+		if def != nil {
+			b.WriteString(" \u00b7 default: the shipped pipeline (lower \u00b7 strip vendor/ \u00b7 strip :tag \u00b7 strip architecture/quant suffix \u00b7 unify . and - between digits); restorable in Settings with \u21ba default pipeline")
+		}
+	case def != nil && f.Kind != KindProviders && f.Kind != KindAliases && f.Kind != KindStrings:
+		b.WriteString(" · default ")
+		b.WriteString(typeLineDefault(f, def))
+	}
+	return b.String()
+}
+
+func typeLineDefault(f Field, def any) string {
+	switch f.Kind {
+	case KindDuration:
+		if d, ok := def.(time.Duration); ok {
+			return FormatDuration(d)
+		}
+	case KindBytes:
+		if s, ok := byteValueString(def); ok {
+			return s
+		}
+	}
+	return fmt.Sprint(def)
+}
+
+// formatBound is TypeLine's range-bound printer: durations via FormatDuration
+// and byte sizes via FormatByteSize so Min/Max never leak as nanoseconds or
+// raw byte counts.
+func (f Field) formatBound(v float64) string {
+	if f.Kind == KindDuration {
+		return FormatDuration(time.Duration(v))
+	}
+	if f.Kind == KindBytes {
+		return FormatByteSize(int64(v))
+	}
+	return trimNum(v)
+}
+
+func trimNum(v float64) string {
+	if v == float64(int64(v)) {
+		return fmt.Sprintf("%d", int64(v))
+	}
+	return fmt.Sprintf("%g", v)
+}

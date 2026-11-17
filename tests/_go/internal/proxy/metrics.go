@@ -1,0 +1,812 @@
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/LLM-4-People/millivolt/internal/config"
+	"github.com/LLM-4-People/millivolt/internal/metrics"
+)
+
+// waitForRecord polls the buffer until it holds at least n records or the
+// timeout elapses. The proxy finalizes and records metrics in a deferred call
+// that runs after the client observes EOF, so a fixed sleep races under
+// parallel test load; polling removes that flake deterministically.
+func waitForRecord(t *testing.T, buf *metrics.Buffer, n int) []*metrics.Record {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if snap := buf.Snapshot(); len(snap) >= n {
+			return snap
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return buf.Snapshot()
+}
+
+func TestStreamingMetricsPopulated(t *testing.T) {
+	// Upstream emits a realistic OpenAI stream with usage chunk.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		chunks := []string{
+			"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+			"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+			"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+			"data: {\"id\":\"1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+			"data: {\"id\":\"1\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n",
+			"data: [DONE]\n\n",
+		}
+		for _, c := range chunks {
+			w.Write([]byte(c))
+			w.(http.Flusher).Flush()
+			time.Sleep(time.Millisecond)
+		}
+	}))
+	defer upstream.Close()
+
+	buf := metrics.NewBuffer(100)
+	srv := httptest.NewServer(New(config.Default(), buf))
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"model-a","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-key")
+	req.Header.Set("X-Proxy-Base-URL", upstream.URL)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	// Wait for the deferred Record to land (see waitForRecord).
+	snap := waitForRecord(t, buf, 1)
+	if len(snap) != 1 {
+		t.Fatalf("recorded %d records, want 1", len(snap))
+	}
+	rec := snap[0]
+	if rec.Stream != true {
+		t.Errorf("Stream = %v, want true", rec.Stream)
+	}
+	if rec.Usage.InputTokens != 10 {
+		t.Errorf("InputTokens = %d, want 10", rec.Usage.InputTokens)
+	}
+	if rec.Usage.OutputTokens != 2 {
+		t.Errorf("OutputTokens = %d, want 2", rec.Usage.OutputTokens)
+	}
+	if rec.Usage.CacheReadTokens != 4 {
+		t.Errorf("CacheReadTokens = %d, want 4", rec.Usage.CacheReadTokens)
+	}
+	if rec.FinishReason != "stop" {
+		t.Errorf("FinishReason = %q, want stop", rec.FinishReason)
+	}
+	if rec.TTFT() == 0 {
+		t.Errorf("TTFT not captured")
+	}
+	if rec.FirstTokenAt.IsZero() {
+		t.Errorf("FirstTokenAt not captured")
+	}
+	if rec.KeyHash == "" {
+		t.Errorf("KeyHash empty; expected sha256 of key")
+	}
+	if strings.Contains(rec.KeyHash, "sk-key") {
+		t.Errorf("KeyHash leaked raw key")
+	}
+}
+
+// TestLiveBeginEndEmitted pins the live-request lifecycle: a "begin" event is
+// published to SSE subscribers the moment a request starts (so the dashboard
+// shows it streaming), and an "end" event lands on completion - while the ring
+// buffer (and thus the durable store) still sees exactly one finalized record.
+func TestLiveBeginEndEmitted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		// Slow stream so we can observe the begin event before completion.
+		for i := 0; i < 3; i++ {
+			w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"))
+			fl.Flush()
+			time.Sleep(120 * time.Millisecond)
+		}
+		w.Write([]byte("data: [DONE]\n\n"))
+		fl.Flush()
+	}))
+	defer upstream.Close()
+
+	buf := metrics.NewBuffer(10)
+	srv := httptest.NewServer(New(config.Default(), buf))
+	defer srv.Close()
+
+	live := buf.SubscribeLive()
+	defer buf.UnsubscribeLive(live)
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-Proxy-Base-URL", upstream.URL)
+	req.Header.Set("X-Proxy-Key", "sk-test")
+
+	respCh := make(chan struct{})
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		close(respCh)
+	}()
+
+	// The begin event must arrive BEFORE the request completes.
+	var sawBegin, sawEnd bool
+	var beginRec *metrics.Record
+	var beginInFlight, endInFlight int64
+	deadline := time.After(3 * time.Second)
+	for !(sawBegin && sawEnd) {
+		select {
+		case ev := <-live:
+			if ev.Phase == "begin" {
+				sawBegin = true
+				beginRec = ev.Record
+				beginInFlight = ev.InFlight
+			}
+			if ev.Phase == "end" {
+				sawEnd = true
+				endInFlight = ev.InFlight
+			}
+		case <-respCh:
+			// Response finished; keep draining events until we see end or timeout.
+		case <-deadline:
+			t.Fatalf("timed out waiting for live events: begin=%v end=%v", sawBegin, sawEnd)
+		}
+	}
+	if !sawBegin {
+		t.Error("no begin event published at request start")
+	}
+	if !sawEnd {
+		t.Error("no end event published at request completion")
+	}
+	if beginRec != nil && beginRec.StatusCode != 0 {
+		t.Errorf("begin record should be unfinalized (status 0), got %d", beginRec.StatusCode)
+	}
+	// The in-flight gauge rides every lifecycle event: this test runs exactly
+	// one request, so begin must report 1 and end must report 0. (The KPI band
+	// renders this value directly - it must never sit stale at the snapshot.)
+	if beginInFlight != 1 {
+		t.Errorf("begin event InFlight = %d, want 1", beginInFlight)
+	}
+	if endInFlight != 0 {
+		t.Errorf("end event InFlight = %d, want 0", endInFlight)
+	}
+
+	// The ring buffer (and hence the store fan-out) must hold exactly ONE
+	// finalized record - lifecycle events must not duplicate it.
+	waitForRecord(t, buf, 1)
+	if n := len(buf.Snapshot()); n != 1 {
+		t.Errorf("ring holds %d records, want exactly 1 (no duplicate from lifecycle events)", n)
+	}
+}
+
+// A provider can signal a failure IN-BAND: HTTP 200, then an error payload in
+// the SSE stream ({"error":{...}}), then EOF. In a retryable class the first
+// frame is dropped and the request re-sent (rescueUpstreamError); this test
+// pins the exhausted end of that path - the SAME error on the second attempt,
+// with the budget spent, relays verbatim so the client sees the failure, and
+// the record carries the provider's envelope plus the absorbed attempt
+// (previously the whole incident class showed as a clean, empty 200: live
+// coralbricks case, the client displayed "provider overloaded", the proxy
+// logged success).
+func TestInBandRetryableStreamErrorExhaustedThenVerbatim(t *testing.T) {
+	var calls atomic.Int32
+	errChunk := "data: {\"error\":{\"message\":\"provider overloaded\",\"type\":\"server_error\",\"code\":\"overloaded\"}}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		w.Write([]byte(errChunk))
+		w.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	buf := metrics.NewBuffer(10)
+	srv := httptest.NewServer(New(config.Default(), buf))
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"model-a","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-key")
+	req.Header.Set("X-Proxy-Base-URL", upstream.URL)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (rescue, then the exhausted verbatim attempt)", n)
+	}
+	// The rescued attempt never reached the wire; the exhausted attempt
+	// relays byte-for-byte, behind the blank line that closed the dropped
+	// event (the pending-event close the rescue writes).
+	if string(body) != "\n"+errChunk {
+		t.Errorf("client body = %q, want the blank-line close then verbatim %q", body, errChunk)
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("client status = %d, want 200 (in-band errors keep the upstream status)", resp.StatusCode)
+	}
+
+	snap := waitForRecord(t, buf, 1)
+	if len(snap) != 1 {
+		t.Fatalf("recorded %d records, want 1", len(snap))
+	}
+	rec := snap[0]
+	if rec.StatusCode != 200 {
+		t.Errorf("StatusCode = %d, want 200", rec.StatusCode)
+	}
+	if rec.ErrorType != "server_error" {
+		t.Errorf("ErrorType = %q, want server_error", rec.ErrorType)
+	}
+	if rec.ErrorMsg != "provider overloaded" {
+		t.Errorf("ErrorMsg = %q, want %q", rec.ErrorMsg, "provider overloaded")
+	}
+	if rec.Retries != 1 || len(rec.Attempts) != 1 {
+		t.Errorf("Retries = %d, attempts = %d, want the one absorbed rescue", rec.Retries, len(rec.Attempts))
+	}
+	if rec.Attempts[0].ErrorType != "server_error" || rec.Attempts[0].ErrorCode != "overloaded" {
+		t.Errorf("absorbed attempt must carry the provider's envelope: %+v", rec.Attempts[0])
+	}
+	if !rec.IsError() {
+		t.Error("record must be flagged as an error")
+	}
+}
+
+// testMidStreamAbortUpstream serves a two-part body, parking the upstream
+// handler on release between the parts so a test client can abort while the
+// proxy is blocked reading. The park replaces the old fixed sleep: the tail
+// cannot arrive until the test closes release, so the abort deterministically
+// lands mid-response no matter how long the parked phase lasts. Callers
+// register close(release) as a defer AFTER defer upstream.Close() (LIFO runs
+// it first), so even a failing test releases the handler before Close drains
+// it. The client disconnect tears the proxy's upstream socket down via the
+// request context, so the proxy finalizes the record without the tail.
+func testMidStreamAbortUpstream(t *testing.T, release <-chan struct{}, contentType string, parts []string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		w.WriteHeader(200)
+		f := w.(http.Flusher)
+		w.Write([]byte(parts[0]))
+		f.Flush()
+		<-release // the proxy is blocked on the body read here
+		for _, p := range parts[1:] {
+			w.Write([]byte(p))
+		}
+	}))
+}
+
+// TestMidStreamClientDisconnectRecords499 pins the documented 499 contract
+// in docs/operations.md: a local client that disconnects
+// mid-stream is recorded with client_disconnected=true and status_code 499 -
+// the `cancel` bucket - never as the committed upstream 200. Cursor streams
+// keep their own documented exception (upstream 200 honored in cursor_bidi);
+// this covers the passthrough paths whose relay dies in markStreamErr.
+func TestMidStreamClientDisconnectRecords499(t *testing.T) {
+	release := make(chan struct{})
+	upstream := testMidStreamAbortUpstream(t, release, "text/event-stream", []string{
+		"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+		"data: [DONE]\n\n",
+	})
+	defer upstream.Close()
+	defer close(release)
+
+	buf := metrics.NewBuffer(10)
+	srv := httptest.NewServer(New(config.Default(), buf))
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-key")
+	req.Header.Set("X-Proxy-Base-URL", upstream.URL)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, 256)
+	if _, err := resp.Body.Read(b); err != nil {
+		t.Fatalf("first chunk read: %v", err)
+	}
+	resp.Body.Close() // the LOCAL client aborts mid-stream
+
+	recs := waitForRecord(t, buf, 1)
+	rec := recs[0]
+	if rec.StatusCode != metrics.StatusClientClosedRequest {
+		t.Errorf("StatusCode = %d, want %d (client closed request)", rec.StatusCode, metrics.StatusClientClosedRequest)
+	}
+	if !rec.ClientDisconnected {
+		t.Error("ClientDisconnected = false, want true")
+	}
+	if rec.IsError() {
+		t.Errorf("a client cancellation must not be an error: %+v", rec)
+	}
+	if rec.ErrorType != "" || rec.ErrorMsg != "" {
+		t.Errorf("disconnect must carry no error fields: type=%q msg=%q", rec.ErrorType, rec.ErrorMsg)
+	}
+}
+
+// Non-stream variant: the same abort while the proxy is blocked spooling a
+// slow JSON body - serveNonStreaming's spool read error classifies through
+// the same markStreamErr choke point. (The abort travels on the request
+// context: a non-streaming client receives nothing until the spool completes,
+// so there is no body for it to close early.)
+func TestMidStreamClientDisconnectNonStreamRecords499(t *testing.T) {
+	release := make(chan struct{})
+	upstream := testMidStreamAbortUpstream(t, release, "application/json", []string{
+		`{"id":"1","choices":[{"message":`,
+		`{"role":"assistant","content":"hi"}}]}`,
+	})
+	defer upstream.Close()
+	defer close(release)
+
+	buf := metrics.NewBuffer(10)
+	srv := httptest.NewServer(New(config.Default(), buf))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-key")
+	req.Header.Set("X-Proxy-Base-URL", upstream.URL)
+
+	go func() {
+		// Result discarded on purpose: the LOCAL client aborting mid-body IS
+		// the scenario under test.
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	// The parked handler guarantees the response is mid-body (its tail is
+	// withheld on the release channel), so this sleep only needs to cover
+	// the request reaching the upstream; 50ms is ample on loopback.
+	time.Sleep(50 * time.Millisecond) // the proxy is blocked spooling the slow body
+	cancel()                          // the LOCAL client aborts
+
+	recs := waitForRecord(t, buf, 1)
+	rec := recs[0]
+	if rec.StatusCode != metrics.StatusClientClosedRequest {
+		t.Errorf("StatusCode = %d, want %d (client closed request)", rec.StatusCode, metrics.StatusClientClosedRequest)
+	}
+	if !rec.ClientDisconnected {
+		t.Error("ClientDisconnected = false, want true")
+	}
+	if rec.IsError() {
+		t.Errorf("a client cancellation must not be an error: %+v", rec)
+	}
+}
+
+// TestClientDisconnectMidErrorBodyKeepsDecidedStatus pins the decided-outcome
+// half of the 499 contract: the upstream HAD decided a final error (500 with
+// max_retries=0) and the LOCAL client disconnected while that error body was
+// still relaying. The record keeps the decided status and stays classifiable
+// as the genuine upstream failure it is ("a genuine 5xx counts even when the
+// client then cancelled") with ClientDisconnected also true. Regression: the
+// unconditional 499 stamp in markClientGone flipped the decided 500 to a
+// non-error 499 (IsError's 429/499 branch), erasing the failure from the
+// error rate, the error explorer, and the errors-only purge.
+func TestClientDisconnectMidErrorBodyKeepsDecidedStatus(t *testing.T) {
+	// The error body is written past the 64 KiB capture cap in one burst, so
+	// captureErrorFromResponse completes deterministically (its bounded read
+	// returns at the cap, never blocking mid-body) and the decided outcome -
+	// status 500 + a classified error type - is on the record BEFORE the
+	// relay pauses and the client aborts.
+	errBody := `{"error":{"type":"server_error","message":"boom","code":"internal"},"pad":"` +
+		strings.Repeat("x", 70*1024) + `"}`
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		f := w.(http.Flusher)
+		w.Write([]byte(errBody))
+		f.Flush()
+		// Parked on the channel instead of a fixed sleep: the tail is
+		// withheld until the test releases, so the abort below
+		// deterministically lands while the proxy is mid-relay.
+		<-release // the proxy is mid-relay of the 500 body here
+		w.Write([]byte(`{"tail":true}`))
+	}))
+	defer upstream.Close()
+	defer close(release)
+
+	cfg := config.Default()
+	cfg.MaxRetries = 0 // the 500 is final - no absorbed retry muddies the assertion
+	buf := metrics.NewBuffer(10)
+	srv := httptest.NewServer(New(cfg, buf))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-key")
+	req.Header.Set("X-Proxy-Base-URL", upstream.URL)
+
+	go func() {
+		// Result discarded on purpose: the LOCAL client aborting mid error
+		// body IS the scenario under test.
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	// The parked tail keeps the response mid-body; the sleep only covers the
+	// request and the 500 burst reaching the proxy, ample at 50ms on loopback.
+	time.Sleep(50 * time.Millisecond) // the proxy is blocked relaying the slow 500 body
+	cancel()                          // the LOCAL client aborts mid-body
+
+	recs := waitForRecord(t, buf, 1)
+	rec := recs[0]
+	if rec.StatusCode != http.StatusInternalServerError {
+		t.Errorf("StatusCode = %d, want 500 (a decided error outcome is never overwritten by the disconnect)", rec.StatusCode)
+	}
+	if !rec.ClientDisconnected {
+		t.Error("ClientDisconnected = false, want true")
+	}
+	if !rec.IsError() {
+		t.Errorf("a decided 5xx with the client then cancelling IS an error: %+v", rec)
+	}
+	if rec.ErrorType == "" {
+		t.Error("ErrorType = empty, want the decided error detail to survive the disconnect")
+	}
+}
+
+// TestMidStreamClientAbortAfterInBandErrorCountsAsError pins the incident
+// regression: a provider that fails IN-BAND on a committed 200 stream (an
+// error event after already-relayed content) and a client that then aborts
+// produce 499 + client_disconnected + the provider's error fields. The
+// provider's failure must count as an error exactly like the same stream
+// whose client had stayed - before the fix, IsError's unconditional 499
+// short-circuit erased the failure from the error rate, the error explorer
+// and the errors-only purge, and the outage surfaced only as client cancels.
+func TestMidStreamClientAbortAfterInBandErrorCountsAsError(t *testing.T) {
+	release := make(chan struct{})
+	upstream := testMidStreamAbortUpstream(t, release, "text/event-stream", []string{
+		"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n" +
+			"data: {\"error\":{\"message\":\"Coral Bricks is temporarily unavailable. Please retry.\",\"type\":\"api_error\",\"code\":\"internal_error\"}}\n\n",
+		"data: [DONE]\n\n",
+	})
+	defer upstream.Close()
+	defer close(release)
+
+	buf := metrics.NewBuffer(10)
+	srv := httptest.NewServer(New(config.Default(), buf))
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-key")
+	req.Header.Set("X-Proxy-Base-URL", upstream.URL)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Read until the provider's in-band error frame has been relayed (the
+	// client abort must happen after the failure reached it, as in the
+	// incident), then abort mid-stream.
+	got := make([]byte, 0, 4096)
+	deadline := time.Now().Add(5 * time.Second)
+	for !bytes.Contains(got, []byte("api_error")) && time.Now().Before(deadline) {
+		b := make([]byte, 512)
+		n, rerr := resp.Body.Read(b)
+		got = append(got, b[:n]...)
+		if rerr != nil {
+			break
+		}
+	}
+	if !bytes.Contains(got, []byte("api_error")) {
+		t.Fatalf("the in-band error frame never reached the client: %q", got)
+	}
+	resp.Body.Close() // the LOCAL client aborts mid-stream
+
+	recs := waitForRecord(t, buf, 1)
+	rec := recs[0]
+	if rec.StatusCode != metrics.StatusClientClosedRequest {
+		t.Errorf("StatusCode = %d, want %d (client closed request)", rec.StatusCode, metrics.StatusClientClosedRequest)
+	}
+	if !rec.ClientDisconnected {
+		t.Error("ClientDisconnected = false, want true")
+	}
+	if rec.ErrorType != "api_error" || rec.ErrorCode != "internal_error" {
+		t.Errorf("record must carry the provider's in-band error: type=%q code=%q", rec.ErrorType, rec.ErrorCode)
+	}
+	if !rec.IsError() {
+		t.Errorf("a provider in-band failure the client aborted around IS an error: %+v", rec)
+	}
+}
+
+// TestWriteDetectedClientAbortAfterInBandErrorCountsAsError is the write-timed
+// twin of TestMidStreamClientAbortAfterInBandErrorCountsAsError: there the
+// abort surfaces at the upstream read (the request context tears the parked
+// read down, and the read-error path fills the record); here the relay is
+// mid-flight when the client disappears. The trailing flood is UNBOUNDED -
+// a kernel can buffer megabytes of unread socket data (a CI runner absorbed
+// the whole former 2 MiB flood and finalized a clean 200 before the abort
+// landed), so the only premise that holds on every runner is that the stream
+// can never end: the abort must land on a blocked client write, a parked
+// upstream read, or the FIN-race clean EOF finishHold guards, and every one
+// of those paths stamps the disconnect. Regression: writeOut's failure arm
+// returned without Analyzer.Fill, so this timing lost ErrorType and IsError
+// where the read-timed twin kept them.
+func TestWriteDetectedClientAbortAfterInBandErrorCountsAsError(t *testing.T) {
+	frame := "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"" + strings.Repeat("x", 512) + "\"}}]}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		f := w.(http.Flusher)
+		w.Write([]byte("data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n"))
+		w.Write([]byte("data: {\"error\":{\"message\":\"Coral Bricks is temporarily unavailable. Please retry.\",\"type\":\"api_error\",\"code\":\"internal_error\"}}\n\n"))
+		f.Flush()
+		// The unbounded flood keeps the stream from ever draining: no kernel
+		// socket buffering can absorb it, so the relay can never see the
+		// stream end. The handler exits when the abort tears the connection
+		// down.
+		for {
+			if _, werr := w.Write([]byte(frame)); werr != nil {
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	buf := metrics.NewBuffer(10)
+	srv := httptest.NewServer(New(config.Default(), buf))
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-key")
+	req.Header.Set("X-Proxy-Base-URL", upstream.URL)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Read until the provider's in-band error frame has been relayed (the
+	// abort must happen after the failure reached the client, exactly like
+	// the read-timed twin), then stop reading.
+	got := make([]byte, 0, 4096)
+	deadline := time.Now().Add(5 * time.Second)
+	for !bytes.Contains(got, []byte("api_error")) && time.Now().Before(deadline) {
+		b := make([]byte, 512)
+		n, rerr := resp.Body.Read(b)
+		got = append(got, b[:n]...)
+		if rerr != nil {
+			break
+		}
+	}
+	if !bytes.Contains(got, []byte("api_error")) {
+		t.Fatalf("the in-band error frame never reached the client: %q", got)
+	}
+	// The flood can never finish, so the relay is still mid-flight wherever
+	// the abort lands: a blocked client write, a parked upstream read, or
+	// the FIN-race clean EOF (finishHold's context guard) - all stamp the
+	// disconnect with the in-band error kept.
+	time.Sleep(200 * time.Millisecond)
+	resp.Body.Close() // the LOCAL client aborts mid-stream
+
+	recs := waitForRecord(t, buf, 1)
+	rec := recs[0]
+	if rec.StatusCode != metrics.StatusClientClosedRequest {
+		t.Errorf("StatusCode = %d, want %d (client closed request)", rec.StatusCode, metrics.StatusClientClosedRequest)
+	}
+	if !rec.ClientDisconnected {
+		t.Error("ClientDisconnected = false, want true")
+	}
+	if rec.ErrorType != "api_error" || rec.ErrorCode != "internal_error" {
+		t.Errorf("a write-detected abort must keep the provider's in-band error: type=%q code=%q", rec.ErrorType, rec.ErrorCode)
+	}
+	if !rec.IsError() {
+		t.Errorf("a provider in-band failure the client aborted around IS an error: %+v", rec)
+	}
+}
+
+// TestStreamCleanEOFAfterRequestCancelStampsDisconnect pins the FIN-race arm
+// of the write-detected abort family: when the LOCAL client aborts while the
+// relay is parked on the upstream read, the upstream FIN can beat the
+// transport's own cancellation and hand the read loop a CLEAN EOF with the
+// request context already canceled. No failed write can observe the dead
+// socket at that point - out is drained, and the only wire contact left in
+// finishHold is flusher.Flush, whose error net/http discards - so without
+// the guard the abort finalizes away as the committed 200 with no
+// disconnect, the exact intermittent CI failure
+// TestWriteDetectedClientAbortAfterInBandErrorCountsAsError showed on a
+// loaded runner. The pre-canceled context reaches the raced state
+// deterministically: the abort must classify like the write-detected twin
+// (499, ClientDisconnected, the provider's in-band error kept), never as a
+// clean 200.
+func TestStreamCleanEOFAfterRequestCancelStampsDisconnect(t *testing.T) {
+	s := New(config.Default(), metrics.NewBuffer(10))
+	rec := &metrics.Record{ID: "stream-eof-cancel", StatusCode: http.StatusOK, Provider: "provider.example"}
+	// A complete small stream: content, the provider's in-band error, then
+	// the upstream ends cleanly - the FIN - with no terminal marker.
+	stream := "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n" +
+		"data: {\"error\":{\"message\":\"Coral Bricks is temporarily unavailable. Please retry.\",\"type\":\"api_error\",\"code\":\"internal_error\"}}\n\n"
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := httptest.NewRecorder()
+	uerr := &upstreamErrorRescue{}
+	s.streamBody(ctx, w, strings.NewReader(stream), rec, false, false, uerr, true)
+	if rec.StatusCode != metrics.StatusClientClosedRequest {
+		t.Errorf("StatusCode = %d, want %d (client closed request)", rec.StatusCode, metrics.StatusClientClosedRequest)
+	}
+	if !rec.ClientDisconnected {
+		t.Error("ClientDisconnected = false, want true")
+	}
+	if rec.ErrorType != "api_error" || rec.ErrorCode != "internal_error" {
+		t.Errorf("the abort must keep the provider's in-band error: type=%q code=%q", rec.ErrorType, rec.ErrorCode)
+	}
+	if !rec.IsError() {
+		t.Errorf("a provider in-band failure the client aborted around IS an error: %+v", rec)
+	}
+}
+
+// abortedClientWriter stands in for a response writer whose client is already
+// gone: every write fails exactly like a socket reset by the peer.
+type abortedClientWriter struct {
+	hdr http.Header
+}
+
+func (w *abortedClientWriter) Header() http.Header { return w.hdr }
+func (w *abortedClientWriter) WriteHeader(int)     {}
+func (w *abortedClientWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write tcp 127.0.0.1:1->127.0.0.1:2: write: connection reset by peer")
+}
+
+// TestNonStreamClientAbortMidSpooledWriteKeepsInBandError is the non-streaming
+// row of the write-detected family: a spooled 200 in-band-error body commits
+// with one large write, and that write failing because the LOCAL client is
+// already gone must stamp the disconnect AND still run the analysis - the
+// upstream delivered and charged the body, so the provider's error survives on
+// the record. The mechanism is driven directly with a failing writer: the
+// former socket variant closed the client right after Do returned, but a
+// kernel can buffer an unread response (a CI runner absorbed the whole spool
+// and finalized a clean 200 before the abort landed), so the mid-write abort
+// itself was not deterministic there. The spool's routing gates stay pinned by
+// the quality suite (TestQualityRetryNonRetryableInBandErrorVerbatim and kin).
+// Regression: the failed write returned before analyzeNonStreamBytes, erasing
+// the provider's error from the record.
+func TestNonStreamClientAbortMidSpooledWriteKeepsInBandError(t *testing.T) {
+	s := New(config.Default(), metrics.NewBuffer(10))
+	rec := &metrics.Record{ID: "spool-abort", StatusCode: http.StatusOK, Provider: "provider.example"}
+	spooled := []byte(`{"error":{"message":"Coral Bricks rejected this request.","type":"invalid_request_error","code":"bad_request"}}`)
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}}
+	s.commitSpooledBody(&abortedClientWriter{hdr: http.Header{}}, resp, spooled, rec, metrics.AnalyzeNonStreamBody(spooled, nil, nil, false))
+	if rec.StatusCode != metrics.StatusClientClosedRequest {
+		t.Errorf("StatusCode = %d, want %d (client closed request)", rec.StatusCode, metrics.StatusClientClosedRequest)
+	}
+	if !rec.ClientDisconnected {
+		t.Error("ClientDisconnected = false, want true")
+	}
+	if rec.ErrorType != "invalid_request_error" {
+		t.Errorf("the spooled in-band error must survive the mid-write abort: type=%q", rec.ErrorType)
+	}
+	// The failed write reached no client, so response_bytes stays zero: only
+	// bytes the client writer accepts are counted.
+	if rec.ResponseBytes != 0 {
+		t.Errorf("ResponseBytes = %d, want 0 (a failed write delivered nothing)", rec.ResponseBytes)
+	}
+}
+
+// TestErrorBodyRelayCountsBytes pins the wire-size accounting for a relayed
+// upstream error: a 5xx body is response relay too, so response_bytes must
+// count it - through nonStreamBody for a JSON error body and through the
+// raw-copy fallback (disconnectWriter's counting) for an event-stream error
+// body. The request side counts its own body; the identity upstream leaves
+// upstream_gzip unset.
+func TestErrorBodyRelayCountsBytes(t *testing.T) {
+	const errBody = `{"error":{"type":"server_error","message":"boom"}}`
+	const reqBody = `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	for _, ct := range []string{"application/json", "text/event-stream"} {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", ct)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(errBody))
+		}))
+		cfg := config.Default()
+		cfg.MaxRetries = 0 // the 500 is final - no absorbed retry muddies the byte count
+		buf := metrics.NewBuffer(10)
+		srv := httptest.NewServer(New(cfg, buf))
+
+		req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(reqBody))
+		req.Header.Set("Authorization", "Bearer sk-key")
+		req.Header.Set("X-Proxy-Base-URL", upstream.URL)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			upstream.Close()
+			srv.Close()
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError || string(body) != errBody {
+			upstream.Close()
+			srv.Close()
+			t.Fatalf("%s: status=%d body=%q, want the 500 error body relayed verbatim", ct, resp.StatusCode, body)
+		}
+		srv.Close()
+		upstream.Close()
+
+		recs := waitForRecord(t, buf, 1)
+		if len(recs) != 1 {
+			t.Fatalf("%s: recorded %d records, want 1", ct, len(recs))
+		}
+		rec := recs[0]
+		if rec.ResponseBytes != int64(len(errBody)) {
+			t.Errorf("%s: ResponseBytes = %d, want %d (the relayed error body counts)", ct, rec.ResponseBytes, len(errBody))
+		}
+		if rec.RequestBytes != int64(len(reqBody)) {
+			t.Errorf("%s: RequestBytes = %d, want %d", ct, rec.RequestBytes, len(reqBody))
+		}
+		if rec.UpstreamGzip {
+			t.Errorf("%s: UpstreamGzip = true on an identity upstream, want false", ct)
+		}
+	}
+}
+
+// Anthropic shape on a byte-transparent stream: event:error + data line with
+// {"type":"error","error":{"type":...}} must be captured the same way. The
+// class is non-retryable (invalid_request_error), so the frame relays
+// verbatim on the first attempt - one upstream call, the event: field line
+// and the data line both byte-preserved, nothing re-sent.
+func TestInBandStreamErrorAnthropicShape(t *testing.T) {
+	var calls atomic.Int32
+	wire := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Overloaded\"}}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		w.Write([]byte(wire))
+		w.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	buf := metrics.NewBuffer(10)
+	srv := httptest.NewServer(New(config.Default(), buf))
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"model-a","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-key")
+	req.Header.Set("X-Proxy-Base-URL", upstream.URL)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if string(body) != wire {
+		t.Errorf("client body = %q, want verbatim %q", body, wire)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (non-retryable class is never re-sent)", n)
+	}
+
+	snap := waitForRecord(t, buf, 1)
+	if len(snap) != 1 {
+		t.Fatalf("recorded %d records, want 1", len(snap))
+	}
+	rec := snap[0]
+	if rec.ErrorType != "invalid_request_error" {
+		t.Errorf("ErrorType = %q, want invalid_request_error", rec.ErrorType)
+	}
+	if rec.ErrorMsg != "Overloaded" {
+		t.Errorf("ErrorMsg = %q, want Overloaded", rec.ErrorMsg)
+	}
+	if !rec.IsError() {
+		t.Error("record must be flagged as an error")
+	}
+}

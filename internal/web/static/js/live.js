@@ -1,0 +1,1572 @@
+// ---------- server aggregation state ----------
+// Every non-table metric surface (KPI band, traffic chart, explorer cards,
+// footer totals) renders from server-computed aggregates over all requests
+// since inception (/metrics/agg*, /metrics/bootstrap) - the client never
+// derives numbers from the ring (the ring now feeds only the request log).
+// kpiAgg is refreshed on a short cadence (the bootstrap tick); chartAgg per
+// window + drift-refresh; explorerAgg per breakdown dimension +
+// stale-refresh. Counters.in_flight stays event-live.
+// The loaded document pins its embedded assets. This is a content identity,
+// not a process ID: unchanged frontend files never need a page refresh.
+const DASHBOARD_VERSION_RE = /^[a-f0-9]{16}$/;
+const loadedDashboardVersion = document.querySelector('meta[name="dashboard-version"]')?.content || '';
+let dashboardReloading = false;
+let kpiAgg = null;
+let chartAgg = null;
+let explorerAgg = null;
+// explorerFailure identifies the scope/dimension whose last scan failed. A
+// payload is usable only while its scopeKey and dim still match the current
+// view; anything else falls back to an honest loading/failure state instead
+// of painting another scope's cards.
+let explorerFailure = null;
+let _pendingRevision = -1; // server lifecycle revision, scoped to the accepted feed
+
+// EMPTY_KPI is the pre-aggregation KPI document: the same wire key set the
+// bootstrap kpi section serves, with the zero and never-measured values the
+// band renders before any aggregate has arrived. The key set is pinned to
+// the server contract by the Go-side mirror test.
+const EMPTY_KPI = {
+  requests: 0,
+  errors: 0,
+  in_flight: 0,
+  cost: 0,
+  cost_per_req: null,
+  cost_per_mtok: null,
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_read_tokens: 0,
+  reasoning_tokens: 0,
+  avg_ttft_ms: null,
+  avg_tps: null,
+};
+
+function kpiNow() {
+  return kpiAgg || EMPTY_KPI;
+}
+function kpiInFlight() {
+  // 0 is a live value - do not fall through to a stale /metrics/agg gauge.
+  if (lastData && lastData.counters && lastData.counters.in_flight != null) {
+    return lastData.counters.in_flight;
+  }
+  return kpiNow().in_flight || 0;
+}
+function kpiTotal() {
+  const k = kpiNow();
+  return (k.requests || 0) + kpiInFlight();
+}
+// explorerScopeKey is the canonical identity of the full log/chart/explorer
+// scope: the order-independent filter set plus the status filter. The by/<dim>
+// breakdown is view state and is deliberately excluded, so a by-only hash
+// change keeps the same scope identity.
+function explorerScopeKey(fs) {
+  return explorerFilterKey(fs) + '|s=' + JSON.stringify(filters.status || '');
+}
+// explorerFilters is the memoized explorer filter set for hot-path matching
+// (derive/scopeQS). Its identity rides the canonical scope key, never the raw
+// hash: a by-only hash change returns the same array, so derive keeps its
+// cached scope; status changes and real filter additions/removals mint a new
+// identity. explorerState itself stays the canonical derivation.
+let _filCache = null;
+function explorerFilters() {
+  // The unchanged-hash fast path must stay cheaper than parsing the hash:
+  // derive() calls this on every live revision. A by-only hash change falls
+  // through to the canonical key and reuses the existing filter array.
+  const hash = location.hash;
+  if (_filCache && _filCache.hash === hash && _filCache.status === filters.status) {
+    return _filCache.filters;
+  }
+  const fs = explorerState().filters;
+  const key = explorerScopeKey(fs);
+  if (_filCache && _filCache.key === key) {
+    _filCache.hash = hash;
+    _filCache.status = filters.status;
+    return _filCache.filters;
+  }
+  _filCache = { hash, status: filters.status, key, filters: fs };
+  return fs;
+}
+function scopeQS() {
+  // the full log scope the chart/footer share: exact-status filter + explorer
+  // filter set (order-independent), encoded once - single owner.
+  const parts = [];
+  if (filters.status) parts.push('s=' + encodeURIComponent(filters.status));
+  for (const f of explorerFilters()) {
+    parts.push('f=' + encodeURIComponent(f.dim + ':' + f.id));
+  }
+  return parts.join('&');
+}
+const chartRequest = requestGate(true);
+// chartAgg carries the request identity (window + scope) that produced it;
+// chartFailure names the current identity whose last request failed. A key
+// change or an explicit invalidate drops the payload and paints the skeleton
+// before the new request, so a held or failed response can never leave the
+// previous window/scope totals on screen.
+let chartKey = null;
+let chartFailure = null;
+function chartReqKey() {
+  const scope = scopeQS();
+  return 'window=' + chartView.window + (scope ? '&' + scope : '');
+}
+function markChartFailure(key) {
+  chartFailure = key;
+  // A failed same-key periodic refresh may retain the last good payload; only
+  // an identity change or invalidate leaves no payload to show.
+  if (!chartAgg || chartAgg.key !== key) {
+    chartAgg = null;
+    renderChart();
+  }
+}
+function fetchChart(mode = 'reuse') {
+  const q = chartReqKey();
+  if (mode === 'invalidate' || chartKey !== q) {
+    chartKey = q;
+    chartAgg = null;
+    chartFailure = null;
+    renderChart();
+  }
+  return chartRequest(q, (accept, signal) => {
+    _lastChartFetch = Date.now();
+    operatorJson('/metrics/agg/chart?' + q, {signal})
+      .then(p => accept(p, true)).catch(() => accept(null, false));
+  }, p => {
+    // Hash state can change before its navigation event dispatches. Never
+    // adopt a payload whose identity no longer matches the current view.
+    if (q !== chartReqKey()) { fetchChart(); return; }
+    if (!p || typeof p !== 'object') { markChartFailure(q); return; }
+    chartAgg = p;
+    chartAgg.key = q;
+    chartFailure = null;
+    renderChart();
+  }, mode, () => {
+    if (q !== chartReqKey()) { fetchChart(); return; }
+    markChartFailure(q);
+  });
+}
+const explorerRequest = requestGate(true);
+
+// explorerReq is the breakdown request key: active dim + the same s=/f=
+// scopeQS the chart/footer use. The server strips the active dim for the
+// cross-filter gallery but applies the full set to rail counts.
+function explorerReq() {
+  const dim = 'dim=' + encodeURIComponent(explorerState().activeDim);
+  const rest = scopeQS();
+  return rest ? dim + '&' + rest : dim;
+}
+function fetchExplorer(mode = 'reuse') {
+  const q = explorerReq();
+  const scope = scopeQS();
+  const dim = explorerState().activeDim;
+  // Invalidation drops the cached payload even for the same scope before the
+  // request is issued, so a purge/restart resync paints loading instead of
+  // keeping aggregates that describe the deleted data. A different scope
+  // invalidates the old payload for the same reason.
+  if (mode === 'invalidate') {
+    explorerAgg = null;
+    explorerFailure = null;
+    renderExplorer();
+    updateScopeLine();
+  } else if (explorerAgg && explorerAgg.scopeKey !== scope) {
+    explorerAgg = null;
+    explorerFailure = null;
+    renderExplorer();
+    updateScopeLine();
+  } else if (explorerFailure && explorerFailure.scopeKey !== scope) {
+    explorerFailure = null;
+    renderExplorer();
+  }
+  // Capture the feed/canonicalization state this payload will reflect. A live
+  // tick can then skip the refetch when nothing changed, instead of folding
+  // all history on a timer.
+  const srcSeq = lastSeq, srcFeed = feedId, srcRev = modelRevision;
+  // The breakdown shows the active dim's distribution over records matching
+  // all other dims' filters - computed server-side over all history since
+  // inception (the filter set is a scoping signal, never a client record set).
+  return explorerRequest(q, (accept, signal) => {
+    operatorJson('/metrics/agg/explorer?' + q, {signal})
+      .then(p => accept(p, true)).catch(() => accept(null, false));
+  }, p => {
+    // Hash state can change before its navigation event dispatches.
+    if (q !== explorerReq()) { fetchExplorer(); return; }
+    if (!p || typeof p !== 'object') { markExplorerFailure(scope, dim); return; }
+    explorerAgg = p;
+    explorerAgg.fetchedAt = Date.now();
+    explorerAgg.scopeKey = scope;
+    explorerAgg.srcSeq = srcSeq;
+    explorerAgg.srcFeed = srcFeed;
+    explorerAgg.srcRev = srcRev;
+    explorerFailure = null;
+    renderExplorer();
+    updateScopeLine();
+  }, mode, () => {
+    // Only the current request reaches this callback (requestGate drops
+    // superseded work), so a failed new scope cannot leave old cards visible.
+    if (q !== explorerReq()) { fetchExplorer(); return; }
+    markExplorerFailure(scope, dim);
+  });
+}
+// markExplorerFailure makes the current view unavailable: the payload is
+// cleared (scope identity is the gate, never innerHTML), and the gallery
+// renders a failure message while the dashboard tick retries.
+function markExplorerFailure(scope, dim) {
+  explorerAgg = null;
+  explorerFailure = {scopeKey: scope, dim};
+  renderExplorer();
+  updateScopeLine();
+}
+// explorerPayloadCurrent reports whether the cached payload describes the
+// current scope and breakdown dimension. A missing, foreign-scope or
+// stale-dimension payload must be refetched even when live data is unchanged.
+function explorerPayloadCurrent() {
+  return !!(explorerAgg && explorerAgg.scopeKey === scopeQS() &&
+    explorerAgg.dim === explorerState().activeDim);
+}
+// refreshExplorerIfStale re-derives the breakdown from the server only when
+// the cached payload aged out AND something it depends on changed: records,
+// the feed epoch, or the canonicalization rules. An idle instance therefore
+// stops folding all history four times a minute per tab. A failed or foreign
+// payload is not usable at any age, so the next tick retries it.
+function refreshExplorerIfStale() {
+  if (!explorerPayloadCurrent()) { fetchExplorer('refresh'); return; }
+  if (Date.now() - explorerAgg.fetchedAt <= dashCfg.explorer_stale_ms) return;
+  if (explorerAgg.srcSeq === lastSeq && explorerAgg.srcFeed === feedId && explorerAgg.srcRev === modelRevision) return;
+  fetchExplorer('refresh');
+}
+function explorerWantsLiveStatus() {
+  if (LIVE_STATUS_FILTERS[filters.status]) return true;
+  const st = explorerState();
+  if (st.activeDim === 'status') return true;
+  return st.filters.some(f => f.dim === 'status' && LIVE_STATUS_FILTERS[f.id]);
+}
+// Live-status explorer refresh cadence: coalesce a burst of lifecycle events
+// into one server refetch. Throttled, not debounced: a sustained event stream
+// must still refresh at the cadence instead of resetting the timer forever.
+// A hidden tab must not schedule work; the visibility handler refreshes once
+// on return, so a backgrounded dashboard cannot keep every tab refetching.
+const EXPLORER_LIVE_REFRESH_MS = 1000;
+let _xpLiveTimer = null;
+function scheduleExplorerLiveRefresh() {
+  if (document.hidden || !explorerWantsLiveStatus()) return;
+  if (_xpLiveTimer) return;
+  _xpLiveTimer = setTimeout(() => {
+    _xpLiveTimer = null;
+    if (document.hidden) return;
+    fetchExplorer('refresh');
+  }, EXPLORER_LIVE_REFRESH_MS);
+}
+
+// ---------- main render ----------
+let lastData = null;
+// O(1) record lookup: maps each id to its index in lastData.records.
+// Rebuilt on full snapshot replace; maintained in-place on incremental
+// upserts and evictions. Makes the hot-path findIndex → O(1) Map.get.
+let _recIdx = new Map();
+function _rebuildRecIdx() {
+  _recIdx.clear();
+  const recs = lastData?.records;
+  if (!recs) return;
+  for (let i = 0; i < recs.length; i++) { if (recs[i]?.id) _recIdx.set(recs[i].id, i); }
+  pruneModelNames();
+}
+// Incremental-feed cursor state: the resume position for
+// /metrics/bootstrap?since= and EventSource Last-Event-ID replay. feedId
+// pins the sequence space to one proxy process - a restart or instance
+// swap invalidates the cursor and forces a full resync.
+let feedId = null;
+let lastSeq = 0;
+
+// derive computes the canonical derived state shared by full renders, live
+// event updates, and the log's windowing. Record-level scoping (the
+// explorer filter set + status filter) applies only to the request log;
+// every numeric surface is the server's since-inception aggregates.
+// One fused O(N) pass over lastData.records per state revision, memoized:
+// every mutation bumps lastData._rev (upsertRec/upsertPendingRec/counters
+// writes) and every scope change swaps the filter-set identity, so a cached
+// derivation can never go stale. All render paths share this one derivation.
+let _der = null, _derData = null, _derRev = -1, _derFS = null;
+let _kpiHtml = '';
+let _kpiHtmlKey = '';
+let _statusHtml = '';
+let _statusHtmlKey = '';
+function derive(data) {
+  const fs = explorerFilters(); // memoized on (hash, status) - identity is the scope key
+  const rev = data._rev || 0;
+  if (_der && _derData === data && _derFS === fs && _derRev === rev) return _der;
+
+  const recs = data.records || [];
+  const ctr = data.counters || {};
+  const liveBuckets = {};
+  for (const name of Object.keys(LIVE_STATUS_FILTERS)) liveBuckets[name] = 0;
+  const liveSeen = new Set();
+  const codeSeen = new Set();
+  // The unfiltered case is the common one: hand back the ring array itself
+  // instead of copying and re-pushing every record on each live revision.
+  // Live/code inventories still walk once because the status dropdown derives
+  // from them. The alias is read-only (log.js only slices/concatenates it); an
+  // abnormal nil entry falls back at the first nil to a copy of the already
+  // seen prefix, then keeps pushing, so nils are omitted exactly as before.
+  const matchAll = !filters.status && fs.length === 0;
+  let scopedRecs = matchAll ? recs : [];
+  let ringClean = matchAll;
+  for (let i = 0; i < recs.length; i++) {
+    const r = recs[i];
+    if (!r) {
+      if (ringClean) { scopedRecs = recs.slice(0, i); ringClean = false; }
+      continue;
+    }
+    if (r.live) {
+      const k = statusClass(r);
+      if (k in liveBuckets) liveBuckets[k]++;
+      liveSeen.add(k);
+    }
+    if (Number(r.status_code) > 0) codeSeen.add(r.status_code);
+    if (!matchAll) {
+      if (recordMatchesStatusFilter(r, filters.status) && fs.every(f => recordMatchesDim(r, f.dim, f.id))) scopedRecs.push(r);
+    } else if (!ringClean) {
+      scopedRecs.push(r);
+    }
+  }
+
+  // Global KPI band (scope-independent), server-side since inception; the
+  // in-flight tile stays event-live via the counters stream.
+  const a = kpiNow();
+  const inFlight = ctr.in_flight || 0;
+  const flightBits = [];
+  for (const name of Object.keys(LIVE_STATUS_FILTERS)) {
+    if (liveBuckets[name]) flightBits.push(liveBuckets[name] + ' ' + name);
+  }
+  const flightSub = flightBits.length ? flightBits.join(' · ') : 'active streams';
+  const totalCost = a.cost || 0;
+  const cacheTotal = a.cache_read_tokens || 0;
+  const inTotal = a.input_tokens || 0;
+  const outTotal = a.output_tokens || 0;
+  // Derived rates own their never-measured state through pct: with no
+  // measurements the shared formatter renders '-', never a fabricated 0%.
+  const cacheRatio = pct(cacheTotal, inTotal);
+  const errRate = pct(a.errors || 0, a.requests);
+  const reasonTotal = a.reasoning_tokens || 0;
+  const costPerReq = Number.isFinite(a.cost_per_req) ? a.cost_per_req : null;
+  const costPerMtok = Number.isFinite(a.cost_per_mtok) ? a.cost_per_mtok : null;
+
+  const kpiKey = [a.requests, a.errors, a.cost, a.input_tokens, a.output_tokens,
+    a.cache_read_tokens, a.reasoning_tokens, a.avg_ttft_ms, a.avg_tps,
+    a.cost_per_req, a.cost_per_mtok, inFlight, flightSub].join('|');
+  let kpiHtml = _kpiHtml;
+  if (_kpiHtmlKey !== kpiKey) {
+    kpiHtml = `
+    <div class="kpi"><h2>Requests</h2><div class="val">${vt(fmt(a.requests))}</div><div class="sub2">all tracked</div></div>
+    <div class="kpi ${inFlight ? 'k-err' : ''}"><h2>In-flight</h2><div class="val">${vt(fmt(inFlight))}</div><div class="sub2">${flightSub}</div></div>
+    <div class="kpi k-cost"><h2>Total cost</h2><div class="val">${vt(fmtMoney(totalCost), 'est USD · ' + fmtMoney(totalCost))}</div><div class="sub2">${costPerReq != null ? vt('~' + fmtMoney(costPerReq) + '/req') : '-'}</div></div>
+    <div class="kpi k-cost"><h2>Blended cost</h2><div class="val">${costPerMtok != null ? vt(fmtMoney(costPerMtok)) + '<span class="unit">/Mtok</span>' : '-'}</div><div class="sub2">${costPerMtok != null ? vt('priced in+out', 'blended over cost-reporting requests only') : '-'}</div></div>
+    <div class="kpi"><h2>Tokens in/out</h2><div class="val val-duo">${vt(fmt(inTotal), fmtFull(inTotal))}<span class="unit">/</span>${vt(fmt(outTotal), fmtFull(outTotal))}</div><div class="sub2">${reasonTotal > 0 ? vt('reasoning ' + fmt(reasonTotal) + ' tok', 'reasoning ' + fmtFull(reasonTotal) + ' tok') : 'no reasoning'}</div></div>
+    <div class="kpi k-cache"><h2>Cache hit</h2><div class="val">${vt(cacheRatio)}</div><div class="sub2">${vt(fmt(cacheTotal) + ' / ' + fmt(inTotal) + ' in', fmtFull(cacheTotal) + ' / ' + fmtFull(inTotal) + ' in')}</div></div>
+    <div class="kpi"><h2>Avg TTFT</h2><div class="val">${a.avg_ttft_ms != null ? vt(fmtDur(a.avg_ttft_ms)) : '-'}</div><div class="sub2">time to first token</div></div>
+    <div class="kpi"><h2>Avg TPS</h2><div class="val">${a.avg_tps != null ? a.avg_tps.toFixed(1) + '<span class="unit">tok/s</span>' : '-'}</div><div class="sub2">throughput</div></div>
+    <div class="kpi ${a.errors ? 'k-err' : ''}"><h2>Error rate</h2><div class="val">${vt(errRate)}</div><div class="sub2">${vt(fmt(a.errors || 0) + ' of ' + fmt(a.requests))}</div></div>
+  `;
+    _kpiHtml = kpiHtml;
+    _kpiHtmlKey = kpiKey;
+  }
+
+  // Status filter options. Live pills (streaming / paused) are always listed
+  // - they are in-flight states, not HTTP codes, so they never appear in the
+  // status_code set. Numeric codes come from finalized rows. The active
+  // filter must always be a rendered option and the control's value, even
+  // when no current record carries that status - otherwise a persisted
+  // filter (dash.filters) that matches nothing right now would silently
+  // filter the data while the dropdown misleadingly shows "all status".
+  const liveOpts = [];
+  for (const name of Object.keys(LIVE_STATUS_FILTERS)) {
+    if (name === 'streaming' || name === 'paused' || liveSeen.has(name) || filters.status === name) {
+      liveOpts.push(name);
+    }
+  }
+  const codes = [...codeSeen].sort((x, y) => x - y);
+  const statuses = liveOpts.concat(codes);
+  if (filters.status && !statuses.some(s => String(s) === String(filters.status))) statuses.push(filters.status);
+  const statusKey = statuses.join('|') + '|' + filters.status;
+  let statusHtml = _statusHtml;
+  if (_statusHtmlKey !== statusKey) {
+    statusHtml = `<option value="">all status</option>` + statuses.map(s => `<option value="${s}" ${String(s)===filters.status?'selected':''}>${s}</option>`).join('');
+    _statusHtml = statusHtml;
+    _statusHtmlKey = statusKey;
+  }
+
+  _der = { recs, scopedRecs, kpiHtml, statusHtml };
+  _derData = data; _derRev = rev; _derFS = fs;
+  return _der;
+}
+
+// bumpData invalidates the cached derivation after a mutation of
+// lastData's records or counters. One owner: every mutator calls this.
+function bumpData() { if (lastData) lastData._rev = (lastData._rev || 0) + 1; }
+
+// recordsRevision is the live-record identity for the request log's archive
+// merge (log.js): it advances only when lastData.records actually changes a
+// row or its membership, never for a counter or KPI refresh. bumpData stays
+// the broader derivation owner; this one keeps counter-only frames from
+// invalidating the merged log window.
+let recordsRevision = 0;
+function bumpRecords() { recordsRevision++; }
+
+// Snapshots and lifecycle events share the same flat counter document. Only
+// real changes invalidate derive; an empty SSE replay after the HTML seed is
+// metadata, not another full-dashboard render. The server's existing pending
+// revision also orders the gauge across independent SSE/HTTP deliveries. Only
+// the gauge is revision-gated: an older event may still contain a missing row.
+// Return the normalized document so full replacements use this same owner.
+function setCounters(counters, pendingRevision) {
+  if (!counters) return counters;
+  const prev = lastData?.counters || {};
+  if (!Number.isSafeInteger(pendingRevision) || pendingRevision < 0 || pendingRevision < _pendingRevision) {
+    counters = {...counters, in_flight: prev.in_flight};
+  } else {
+    _pendingRevision = pendingRevision;
+  }
+  if (!lastData) return counters;
+  const keys = Object.keys(counters);
+  if (keys.length === Object.keys(prev).length && keys.every(k => counters[k] === prev[k])) return counters;
+  lastData.counters = counters;
+  bumpData();
+  return counters;
+}
+
+// renderBand re-renders the KPI band alone (server-agg fetches + live
+// in-flight counter merges). It reads the same lastData the full derive does.
+function renderBand() {
+  if (!lastData) return;
+  updateSection('kpis', derive(lastData).kpiHtml);
+}
+
+// The explorer's full-scope fold also owns the footer count. Never perform
+// another history scan or substitute the bounded ring for all-history truth.
+function updateScopeLine() {
+  if (!lastData) return;
+  const total = kpiTotal();
+  const scope = scopeQS();
+  const matches = !scope ? total : (explorerAgg?.scopeKey === scope ? explorerAgg.scope?.matches : null);
+  const setF = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  setF('f-scope', (matches == null ? '…' : fmt(matches)) + ' of ' + fmt(total));
+}
+
+// renderLive re-renders the derived surfaces on a live event without touching
+// the request log wholesale (rows update incrementally so the list never
+// shifts under the cursor and text selection survives) and without re-rendering
+// an open drawer or the explorer gallery on every event (both throttled to a
+// human cadence instead). One derivation feeds every surface.
+// renderLive is coalesced behind requestAnimationFrame: rapid bursts of SSE
+// events (begin/update/end/record in one frame) run one pipeline pass instead
+// of N, cutting per-frame DOM work to a constant. rAF naturally pauses in
+// hidden tabs; on visibilitychange a flushed flag ensures the latest state
+// paints immediately when the user returns.
+let _renderQueued = false;
+let _renderDirty = false;
+function scheduleRenderLive() {
+  _renderDirty = true;
+  if (_renderQueued) return;
+  _renderQueued = true;
+  requestAnimationFrame(() => { _renderQueued = false; if (_renderDirty) { _renderDirty = false; renderLive(); } });
+}
+function renderLive() {
+  if (!lastData) return;
+  const d = derive(lastData);
+  updateSection('kpis', d.kpiHtml);
+  updateSection('f-status', d.statusHtml);
+  if ($('f-status').value !== filters.status) $('f-status').value = filters.status;
+  renderRequestsIncremental(d.scopedRecs);
+  updateLogStats(d);
+  // The explorer gallery renders server aggregates (refreshed on its own
+  // cadence and rendered on arrival). Re-rendering it per live event only
+  // rebuilt identical DOM.
+  refreshFooterState();
+  updateScopeLine();
+  // An open drawer follows the same live lifecycle as its row: repaint only
+  // when the record object actually changed (a pending request finalized, a
+  // retry attempt arrived). Unrelated traffic leaves the drawer DOM and its
+  // scroll position untouched.
+  if (drawerId && recordById(drawerId) !== _drawerRecord) renderDrawer();
+}
+
+// Canonical scope and active breakdown of the last full render. Full paths
+// (navigation, status filter, bootstrap/restart, purge) update these, so a
+// later by-only navigation is compared against the actual last render, not
+// just the last hash-routed one. _routedHash gates the update while a hash
+// change is still queued: a renderAll that sees the un-dispatched hash must
+// not claim that scope before onNavigate issues its explorer/chart fetches.
+let _navScopeKey = null;
+let _navActiveDim = null;
+let _routedHash = null;
+
+function renderAll(data) {
+  lastData = data;
+  // Reset scroll against the old layout, before any DOM writes. Setting it
+  // after inserting the table forces a complete synchronous table layout.
+  resetLogWindow();
+  const d = derive(data);
+  updateSection('kpis', d.kpiHtml);
+
+  // Chart + explorer render from server aggregates; the request log is the
+  // only surface that renders the (explorer-scoped) ring records.
+  renderChart();
+  updateSection('f-status', d.statusHtml);
+  if ($('f-status').value !== filters.status) $('f-status').value = filters.status;
+  renderRequests(d.scopedRecs);
+  updateLogStats(d);
+  renderExplorer();
+
+  // Keep the open drawer in sync as new records stream in.
+  if (drawerId) renderDrawer();
+
+  // Status-line footer: live state + scoped count + scoped error count/rate
+  // (server-computed; in-flight stays in the KPI band only - each stat lives
+  // in exactly one place).
+  refreshFooterState();
+  updateScopeLine();
+  // Claim this scope only when the router has dispatched it. A render between
+  // a hash assignment and its hashchange (for example a bootstrap tick) must
+  // leave the pending scope for onNavigate to route and fetch.
+  if (location.hash === _routedHash) {
+    _navScopeKey = explorerScopeKey(explorerFilters());
+    _navActiveDim = explorerState().activeDim;
+  }
+}
+
+// ---------- live updates via SSE ----------
+// applySnapshotPayload consumes a live-feed snapshot payload (the
+// /metrics/bootstrap response or the SSE "snapshot" event). Incremental
+// payloads (server-side cursor resume) merge new records into the existing
+// state; full payloads replace it. The feed_id guard invalidates the cursor
+// across proxy restarts and deletions: a delta cannot communicate removals.
+function applySnapshotPayload(data, bootstrapApplied = false) {
+  const feedChanged = data.feed_id && feedId !== data.feed_id;
+  if (data.feed_id === feedId && !data.incremental &&
+      (data.seq < lastSeq || data.pending_revision < _pendingRevision)) {
+    // An SSE reconnect snapshot can lag a newer HTTP delta/lifecycle event.
+    // Re-capture behind the same full barrier before replacing either set.
+    fetchBootstrap('full');
+    return false;
+  }
+  if (!bootstrapApplied && !applyModelCanon(data.model_canon, modelRevision === null)) return false;
+  if (feedChanged) _pendingRevision = -1;
+  if (data.feed_id) {
+    if (feedId && feedId !== data.feed_id) {
+      // An SSE snapshot can win against an older in-flight bootstrap too.
+      // Supersede it before issuing this epoch's state refresh.
+      ++_bootReq;
+      feedId = data.feed_id;
+      lastSeq = 0;
+      lastRender = {}; // force every section to rebuild against the new feed
+      // A restart or deletion invalidated the prior replay epoch.
+      // The snapshot below rebuilds the log/drawer from the new feed, and
+      // refreshAfterRestart re-pulls every other server-fed surface (aggregates
+      // - including the chart, which must not ride the dead process's
+      // timeline - pause holds, provider limits, effective config - which
+      // re-arms this page's own cadences) so the whole page reflects the new
+      // process. A bootstrap already applied its state and checked the asset
+      // version; only an SSE snapshot needs that additional state pull.
+      refreshAfterRestart(bootstrapApplied);
+    } else if (!feedId) {
+      feedId = data.feed_id;
+    }
+  }
+  lastSeq = Math.max(lastSeq, data.seq || 0);
+  // In-flight view: the server includes current streaming requests
+  // (in_flight_records) in every payload - a page that loaded mid-request
+  // missed the ephemeral "begin" event, and the row must still appear (the
+  // row renderer already draws records without status_code as streaming).
+  // A pending copy never clobbers a finalized row with the same id (a
+  // snapshot can race its own "end" publish - see upsertPendingRec).
+  const pending = data.in_flight_records;
+  const revision = lastData?._rev || 0;
+  const counters = setCounters(data.counters, data.pending_revision);
+  if (!feedChanged && data.incremental && lastData && Array.isArray(lastData.records)) {
+    for (const r of (data.records || [])) {
+      if (r) r.live = false;
+      upsertRec(r);
+    }
+    if (Array.isArray(pending)) {
+      for (const r of pending) upsertPendingRec(r, data.pending_revision);
+    }
+    lastData.seq = data.seq;
+    if ((lastData._rev || 0) !== revision) scheduleRenderLive();
+  } else {
+    // Full replacement: fold the in-flight rows into the record set the
+    // snapshot renders from. Finalized IDs win even for a replay from an
+    // older process that captured final/pending in separate transitions.
+    data.counters = counters;
+    if (!Array.isArray(data.records)) data.records = [];
+    for (const r of data.records) { if (r) r.live = false; }
+    if (Array.isArray(pending) && pending.length) {
+      const finalIds = new Set(data.records.map(r => r.id));
+      for (const r of pending) {
+        if (r && r.id && !finalIds.has(r.id)) {
+          r.live = true; r._pendingRevision = data.pending_revision; data.records.push(r);
+        }
+      }
+    }
+    bumpRecords();
+    renderAll(data);
+    _rebuildRecIdx();
+    // A same-feed stale-cursor resync (ring eviction) does not refetch the
+    // chart: server buckets still describe this process; the configured
+    // chart cadence owns freshness. A feed change
+    // handled the dead process's chart in the branch above.
+  }
+  // EventSource reconnects to its immutable original URL. Rebind it once to
+  // the accepted epoch/cursor, or every later reconnect would replay full.
+  // Closing alone does not protect queued callbacks; startStream also pins
+  // every handler to the source instance and its replay epoch.
+  if (feedChanged && source) startStream(lastSeq, feedId);
+  return true;
+}
+
+// One request is exactly one row at every lifecycle stage: append-once,
+// upsert-by-id afterward - shared by the ring broadcast ("record"), the
+// lifecycle events ("begin"/"end"), and incremental snapshot merges, so they
+// can never produce duplicates.
+// _evict removes the oldest record from the ring when the cap is exceeded,
+// keeping the Map index in sync without a full rebuild.
+const RING_SLACK = 64; // internal constant - batches eviction to amortize O(N) reindex
+function _evict(recs) {
+  if (recs.length <= dashCfg.history_size + RING_SLACK) return;
+  const cut = recs.length - dashCfg.history_size;
+  recs.splice(0, cut);
+  // Rebuild the index once per batch rather than decrementing every entry.
+  _rebuildRecIdx();
+}
+
+// upsertRec folds one finalized record into lastData.records. Pending events
+// use upsertPendingRec, whose monotonic gate cannot undo a finalized row.
+// Returns true when the record genuinely arrived (inserted, or a pending row
+// updated to final - a new durably-counted arrival) and false when the id was
+// already a finalized row (a replayed/duplicate delivery). Callers that fold
+// records into live aggregates must gate on the result - replay-tolerant
+// delivery is by design, and a naive per-event fold double-counts replays.
+// A pure-replay of a finalized row is a true no-op: no replacement, no
+// bumpData, no render.
+function upsertRec(rec) {
+  const recs = lastData?.records || [];
+  if (!rec || !rec.id) return false; // nothing arrived - never a foldable arrival
+  let i = _recIdx.get(rec.id);
+  if (i !== undefined && recs[i]?.id === rec.id) {
+    // A replay of an already-finalized row: same content, no visual change.
+    // Return before replacing the ring object: the unfiltered derivation
+    // aliases that ring, so a bump-less replacement would repaint a row the
+    // derivation still considers current (and update the drawer silently).
+    if (!recs[i].live) return false;
+    recs[i] = rec;
+    _recIdx.set(rec.id, i);
+    if (recs.length > dashCfg.history_size) { _evict(recs); }
+    bumpData();
+    bumpRecords();
+    return true; // pending → finalized: a real transition
+  }
+  // New record: append + index.
+  recs.push(rec);
+  _recIdx.set(rec.id, recs.length - 1);
+  if (recs.length > dashCfg.history_size) { _evict(recs); }
+  bumpData();
+  bumpRecords();
+  return true;
+}
+
+// upsertPendingRec merges a server-provided in-flight (pending) record - the
+// flip side of upsertRec for snapshot deliveries. A pending copy is stale by
+// construction when a finalized record with the same id already exists (the
+// snapshot was computed before that request's "end" publish): keep the
+// finalized row instead of regressing it to a never-ending streaming row.
+function upsertPendingRec(rec, pendingRevision) {
+  const recs = lastData?.records || [];
+  if (!rec || !rec.id) return recs;
+  if (!Number.isSafeInteger(pendingRevision) || pendingRevision < 0) return recs;
+  let i = _recIdx.get(rec.id);
+  if (i !== undefined && recs[i]?.id === rec.id) {
+    // The same request's watermark orders every pending field, including
+    // pause/throttle changes that do not append retry attempts. Keep it on
+    // the existing row, not another index or a global whole-event gate.
+    if (!recs[i].live || pendingRevision < recs[i]._pendingRevision) return recs;
+    rec.live = true; rec._pendingRevision = pendingRevision;
+    recs[i] = rec; bumpData(); bumpRecords();
+    return recs;
+  }
+  rec.live = true; rec._pendingRevision = pendingRevision;
+  recs.push(rec);
+  _recIdx.set(rec.id, recs.length - 1);
+  if (recs.length > dashCfg.history_size) { _evict(recs); }
+  bumpData();
+  bumpRecords();
+  return recs;
+}
+
+// startStream opens the SSE feed. since/feed seed the initial snapshot's
+// cursor (a page that just bootstrapped replays only the delta); a
+// reconnect ignores them - the browser echoes Last-Event-ID, and a feed
+// mismatch degrades to a full (capped) snapshot.
+function startStream(since, feed) {
+  if (source) source.close();
+  const parts = [];
+  if (feed) parts.push('feed=' + encodeURIComponent(feed));
+  if (since > 0) parts.push('since=' + String(since));
+  const stream = source = new EventSource('/metrics/live/stream' + (parts.length ? '?' + parts.join('&') : ''));
+  const current = () => source === stream && (!feed || feed === feedId);
+  stream.onopen = () => { if (current()) setFooterLive(true); };
+  stream.onerror = () => { if (current()) setFooterLive(false); };
+  stream.addEventListener('snapshot', (e) => {
+    if (source !== stream) return;
+    try { applySnapshotPayload(JSON.parse(e.data)); } catch(err) {}
+  });
+  stream.addEventListener('reset', (e) => {
+    if (!current()) return;
+    try {
+      const next = JSON.parse(e.data).feed_id;
+      if (typeof next !== 'string' || !next || next === feedId) return;
+      // The full-bootstrap gate owns close, invalidation and cursor-safe reopen.
+      fetchBootstrap('full');
+    } catch(err) {}
+  });
+  // A finalized record from the ring. The event's Last-Event-ID (the id:
+  // field the stream carries) is the resume cursor - on reconnect the browser
+  // sends it back and the server replays only the newer records.
+  stream.addEventListener('record', (e) => {
+    if (!current()) return;
+    try {
+      const rec = JSON.parse(e.data);
+      if (!applyModelCanon(rec?.model_canon)) return;
+      delete rec.model_canon; // keep envelope metadata only in the shared dictionary
+      rec.live = false;
+      const seq = parseInt(e.lastEventId, 10);
+      if (!isNaN(seq)) lastSeq = Math.max(lastSeq, seq);
+      upsertRec(rec);
+      scheduleRenderLive();
+    } catch(err) {}
+  });
+  // Per-request lifecycle: a request appears the moment it starts ("begin") and
+  // is finalized when it completes ("end"), so the log shows it streaming live
+  // instead of only after it finishes. Upsert by id - begin/end share the
+  // record's stable id; "end" carries the same authoritative record the ring
+  // also persists, so we replace any pending row with the finalized one. Each
+  // lifecycle event also carries the process-wide in-flight gauge
+  // ("in_flight"): merge it into the counters so the global KPI band reacts
+  // the moment a stream starts/ends - the bootstrap counters (snapshot)
+  // otherwise only refresh on the tick cadence.
+  const upsertLive = (e) => {
+    if (!current()) return;
+    try {
+      const ev = JSON.parse(e.data);
+      if (!ev.record || !ev.record.id || !applyModelCanon(ev.model_canon)) return;
+      ev.record.live = e.type !== 'end';
+      // The gauge merge is a real mutator: keep the fresh-copy pattern (other
+      // code may hold the old counters object) and bump the derivation only
+      // when in_flight actually changed. The bump matters because the ring
+      // "record" event usually finalizes the row first - that end event is
+      // then a replay that bumps nothing in upsertRec, so without this the
+      // gauge correction would memo-hit and the In-flight tile would keep the
+      // pre-end value. An unchanged gauge (an update re-carrying its begin's
+      // value) must not re-run the O(N) derive pass.
+      const counters = { ...(lastData?.counters || {}) };
+      if (typeof ev.in_flight === 'number') counters.in_flight = ev.in_flight;
+      setCounters(counters, ev.pending_revision);
+      if (e.type === 'end') {
+        upsertRec(ev.record);
+      } else {
+        upsertPendingRec(ev.record, ev.pending_revision);
+      }
+      scheduleRenderLive();
+      scheduleExplorerLiveRefresh();
+    } catch(err) {}
+  };
+  stream.addEventListener('begin', upsertLive);
+  stream.addEventListener('end', upsertLive);
+  // Mid-flight progress (an absorbed retry attempt): the record is still live
+  // and not final, but we upsert it so the in-flight row reflects the retry as
+  // it happens. Shares the record's stable id - upsert, never a duplicate.
+  stream.addEventListener('update', upsertLive);
+  // No poll timer: the 5s tick is the fallback - fetchBootstrap resumes via
+  // the ?since=&feed= cursor, so a tick with SSE down still folds the records
+  // missed while the stream was silent (and one timer, never stacked).
+}
+
+// Footer clock is managed by _armClock() below (visibility-aware: paused in
+// hidden tabs, resumed on return). Resize is rAF-gated to avoid per-frame
+// layout thrash. An open metrics menu re-anchors on the same gate - it is
+// fixed-positioned (it must escape the card's overflow clip), so shrinking
+// the window can never crop it. Any scroll re-anchors it too: a fixed box
+// does not follow its trigger through page or inner-region scrolling, and
+// the capture listener sees scrolls of every nested region.
+window.addEventListener('resize', () => {
+  if (_resizeRaf) return;
+  _resizeRaf = requestAnimationFrame(() => {
+    _resizeRaf = 0;
+    syncMetricsMenuEdge();
+    if (!lastData) return;
+    // An existing plot needs only new pixel dimensions; recomputing the
+    // payload, totals and legend on every resize frame was pure waste. Fall
+    // back to the full path when no plot exists yet (first viable layout).
+    if (_up) resizeChart(); else renderChart();
+  });
+});
+let _resizeRaf = 0;
+window.addEventListener('scroll', () => syncMetricsMenuEdge(), true);
+
+// Visibility handling: stop the 5s tick + 1s clock while the tab is hidden
+// (SSE keeps state current; Chrome throttles background timers but doesn't
+// stop them, wasting CPU + server round-trips). On return: re-arm + flush
+// any state that changed while hidden, and scheduleRenderLive's rAF flag
+// ensures the pending pipeline runs immediately.
+//
+// dashCfg.background_refresh opts out of the teardown (dash_background_refresh):
+// the tick keeps running at the browser's throttled background cadence, so the
+// poll keeps re-minting the session cookie and the data stays near-current for
+// a reopened tab. A Web Lock is held while hidden - Chromium documents held
+// locks as a freezing exemption, so the SSE feed survives Energy-Saver
+// freezing. Android and iOS still suspend at the OS level regardless.
+let _clockTimer = null;
+// Initialized from the page's actual visibility: a dashboard opened in a
+// background tab must not arm its 1s clock or 5s poll before the operator
+// returns. The visible transition below runs the same resume path.
+let _wasHidden = !!document.hidden;
+let _bgLockGen = 0;
+let _bgLockRelease = null;
+// Per-document lock name: the lock is a per-document freeze-exemption marker,
+// not mutual exclusion, so two dashboard tabs must never contend for one
+// grant (a shared name would exempt only one tab and strand the other's
+// request).
+const _bgLockName = 'millivolt-background-refresh-' + Math.random().toString(36).slice(2);
+function dashHoldBackgroundLock() {
+  if (!dashCfg.background_refresh || _bgLockRelease) return;
+  if (!navigator.locks || typeof navigator.locks.request !== 'function') return;
+  const gen = ++_bgLockGen;
+  navigator.locks.request(_bgLockName, () => new Promise(resolve => {
+    // A grant landing for a superseded hold (hide/show cycled while the
+    // grant was pending) self-releases instead of claiming the live hold.
+    if (gen !== _bgLockGen) { resolve(); return; }
+    _bgLockRelease = resolve;
+  })).catch(() => { if (gen === _bgLockGen) _bgLockRelease = null; });
+}
+function dashReleaseBackgroundLock() {
+  // Bump the generation even with no live claim: a grant may still be
+  // pending for a released hold (or a hot-reloaded toggle-off), and the late
+  // callback must self-release instead of claiming while visible.
+  ++_bgLockGen;
+  if (!_bgLockRelease) return;
+  const release = _bgLockRelease;
+  _bgLockRelease = null;
+  release();
+}
+// dashStopDashboardTick tears the 5s poll down outside a visibility
+// transition: the hot-reloaded toggle-off path (applyDashValues) uses it so a
+// hidden tab stops polling the moment the flag turns off.
+function dashStopDashboardTick() {
+  if (_dashTickTimer) { clearInterval(_dashTickTimer); _dashTickTimer = null; }
+}
+// Footer clock cadence: the weekday+time stamp reads second-accurate, and
+// the same tick re-checks hold/debug expiry for the footer state line.
+const FOOTER_CLOCK_MS = 1000;
+function _armClock() {
+  if (_clockTimer) return;
+  _clockTimer = setInterval(() => {
+    const fc = $('f-clock');
+    if (fc) {
+      const now = new Date();
+      fc.textContent = now.toLocaleDateString(undefined, { weekday: 'long' }) + ' ' + now.toLocaleTimeString();
+    }
+    if (pauseActive() || (pauseState.holds || []).length || debugActive() || (debugState.sessions || []).length) refreshFooterState();
+  }, FOOTER_CLOCK_MS);
+}
+if (_wasHidden) dashHoldBackgroundLock(); else _armClock();
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    _wasHidden = true;
+    clearInterval(_clockTimer); _clockTimer = null;
+    if (!dashCfg.background_refresh && _dashTickTimer) { clearInterval(_dashTickTimer); _dashTickTimer = null; }
+    dashHoldBackgroundLock();
+  } else if (_wasHidden) {
+    _wasHidden = false;
+    _armClock();
+    armDashboardTicks();
+    dashReleaseBackgroundLock();
+    // Flush any state that changed while hidden (SSE may have delivered
+    // new records while the aggregate payloads aged). A live-status explorer
+    // view refreshes immediately instead of waiting for the next event.
+    fetchBootstrap('resume');
+    if (explorerWantsLiveStatus()) fetchExplorer('refresh');
+    scheduleRenderLive();
+  }
+});
+
+// Filters: any change to a filter control re-scopes the request log (the only
+// client-side surface the explorer/status filters still drive). Chart / footer
+// / explorer refetch server aggregates with the same s=/f= set.
+$('f-status').addEventListener('change', doFilter);
+
+// Traffic chart controls: the preset dropdown (curated series combos -
+// populated from CHART_PRESETS, the single owner), window + percentile
+// selects. All restore their persisted values; the legend toggles series
+// visibility (delegated on the container so updateSection's innerHTML swaps
+// never drop the listener); the view persists in dash.chart.
+fillChartControls();
+$('chart-preset').addEventListener('change', e => setChartPreset(e.target.value));
+$('chart-window').addEventListener('change', e => setChartWindow(e.target.value));
+$('chart-pct').addEventListener('change', e => setChartPct(e.target.value));
+$('traffic-legend').addEventListener('click', e => {
+  const b = e.target.closest('.leg-item');
+  if (b) toggleChartSeries(b.dataset.series);
+});
+// The summary metrics picker (the strip's tiles are plain readouts): the
+// trigger opens the menu, rows flip the same dash.chart hidden set through
+// toggleSummaryMetric, Escape and outside clicks close, and focus returns
+// to the trigger. Row clicks keep the menu open for multi-selection.
+$('chart-metrics-btn').addEventListener('click', () => {
+  const open = $('chart-metrics-menu').hidden;
+  setMetricsMenuOpen(open);
+  if (open) { const first = $('chart-metrics-menu').querySelector('.metrics-row'); if (first) first.focus(); }
+});
+$('chart-metrics-menu').addEventListener('click', e => {
+  const row = e.target.closest('.metrics-row');
+  if (row) toggleSummaryMetric(row.dataset.metric);
+});
+
+// Server-state refresh cadence from dashCfg (the bootstrap payload's dash
+// section; GET /admin/config re-pulls it after a restart): the tick polls
+// /metrics/bootstrap at dash_poll_interval - KPI + operator state + the
+// record delta since the cursor (which makes the tick the SSE fallback too:
+// records missed while the stream was silent fold on the same resume rule);
+// the chart refreshes server truth every dash_chart_refresh; the explorer
+// breakdown refreshes when stale.
+let _dashTickTimer = null;
+let _lastChartFetch = 0;
+function armDashboardTicks() {
+  if (_dashTickTimer) clearInterval(_dashTickTimer);
+  _dashTickTimer = setInterval(() => {
+    fetchBootstrap('resume');
+    const now = Date.now();
+    if (now - _lastChartFetch >= dashCfg.chart_ms) {
+      fetchChart('refresh');
+    }
+    refreshExplorerIfStale();
+  }, dashCfg.poll_ms);
+}
+if (!_wasHidden) armDashboardTicks();
+
+// Explorer: the URL hash drives the log's scope and the breakdown dimension.
+// onNavigate fires on hash change and once immediately (deep-link restore).
+// A changed filter set/status is a new scope and takes the full render path.
+// A by-only hash change is view state: repaint the explorer and fetch just the
+// new breakdown, leaving the log window, chart, drawer and footer intact.
+onNavigate(() => {
+  const st = explorerState();
+  const scopeKey = explorerScopeKey(st.filters);
+  _routedHash = location.hash;
+  if (!lastData || scopeKey !== _navScopeKey) {
+    _navScopeKey = scopeKey;
+    _navActiveDim = st.activeDim;
+    if (lastData) renderAll(lastData);
+    fetchExplorer();
+    fetchChart(); // chart is SCOPED to the log's filter set (all-history server-side)
+    return;
+  }
+  if (st.activeDim !== _navActiveDim) {
+    _navActiveDim = st.activeDim;
+    renderExplorer();
+    fetchExplorer();
+  }
+});
+
+// ---------- boot: server-seeded state, one application gate ----------
+// fetchBootstrap is the one server-state pull, shared by boot, the 5s tick,
+// purge resyncs, and restart resyncs. GET /metrics/bootstrap carries
+// everything the page renders before the slower chart/explorer scans land:
+// the ring snapshot (full and capped on a cursor-less call, a delta on a
+// cursor resume - never the full ring twice), the since-inception KPI
+// aggregate, the effective dashboard config, and the operator pause/limit
+// state. Initial HTML embeds this exact document; boot consumes it once
+// through the same gate without another network request.
+//   mode 'full'   forced full snapshot, no cursor (boot, purge re-sync)
+//   mode 'resume' cursor resume - a tick delta; a foreign feed degrades
+//                 server-side to a full snapshot, never a silent miss
+//   mode 'none'   state surfaces only - records came from the SSE snapshot
+// Overlapping requests are superseded by issue order (the newest request's
+// response wins): a stale in-flight delta computed before a purge's full
+// resync must never re-apply pre-purge rows after the fresh snapshot landed.
+let _bootReq = 0;
+let _bootFull = null; // mandatory replacement; ordinary polls join instead of superseding it
+function refreshDashboardVersion(version) {
+  if (dashboardReloading) return true;
+  if (typeof version !== 'string' || !DASHBOARD_VERSION_RE.test(version) ||
+      !DASHBOARD_VERSION_RE.test(loadedDashboardVersion) || version === loadedDashboardVersion) return false;
+  dashboardReloading = true;
+  // Normal reload revalidates the existing no-cache/ETag assets. No cache
+  // busting URL or second asset watcher; persisted filters and chart survive.
+  location.reload();
+  return true;
+}
+
+// Consume the server's inert JSON block once. It is the same bootstrap
+// document, not a second state/render path. Removing it releases the serialized
+// copy; later full resyncs must read fresh state. Bad/missing seeds fall back
+// to the existing endpoint, never leave the dashboard blank.
+function takeEmbeddedBootstrap() {
+  const node = $('dashboard-bootstrap');
+  if (!node) return null;
+  const raw = node.textContent;
+  node.remove();
+  try {
+    const p = JSON.parse(raw);
+    if (!p || typeof p !== 'object' || !Array.isArray(p.records) ||
+        !p.counters || typeof p.counters !== 'object' || !p.kpi || typeof p.kpi !== 'object' ||
+        typeof p.feed_id !== 'string' || !p.feed_id || !Number.isSafeInteger(p.seq) || p.seq < 0 ||
+        !Number.isSafeInteger(p.pending_revision) || p.pending_revision < 0 ||
+        p.incremental !== false || !DASHBOARD_VERSION_RE.test(p.dashboard_version)) return null;
+    return p;
+  } catch (_) { return null; }
+}
+
+function fetchBootstrap(mode, after) {
+  if (dashboardReloading) return;
+  if (mode !== 'full' && _bootFull) {
+    return _bootFull.then(p => { if (after && !dashboardReloading) after(p); return p; });
+  }
+  const my = ++_bootReq;
+  if (mode === 'full') {
+    // A full response replaces rows. Stop live delivery before its snapshot
+    // is captured, or an older response could erase a newer row while keeping
+    // its advanced cursor. Source identity rejects callbacks already queued.
+    if (source) source.close();
+    source = null;
+  }
+  const operatorRevisions = captureOperatorRevisions();
+  const q = [];
+  if (mode === 'resume' && feedId && lastSeq > 0) {
+    q.push('since=' + String(lastSeq), 'feed=' + encodeURIComponent(feedId));
+  }
+  const embedded = mode === 'full' ? takeEmbeddedBootstrap() : null;
+  const response = embedded ? Promise.resolve(embedded)
+    : operatorJson('/metrics/bootstrap' + (q.length ? '?' + q.join('&') : ''));
+  const request = response.then(p => {
+      if (dashboardReloading) return;
+      if (my === _bootReq) {
+        if (refreshDashboardVersion(p.dashboard_version)) return;
+        // A stale/zero resume cursor can unexpectedly produce a full payload.
+        // Re-capture it behind the same barrier; never replace rows under SSE.
+        if (mode === 'resume' && !p.incremental && source) return fetchBootstrap('full');
+        const previous = lastData;
+        const revision = previous?._rev || 0;
+        // Changed rules need a full set of names/rows; mixed revisions from a
+        // reload during serialization must be re-captured before any adoption.
+        if (!validModelCanon(p.model_canon, true)) throw new Error('invalid observer metadata');
+        if ((p.debug?.model_canon && p.debug.model_canon.revision !== p.model_canon.revision) ||
+            (modelRevision !== null && p.model_canon.revision !== modelRevision && mode !== 'full') ||
+            (p.feed_id === feedId && !p.incremental && (p.seq < lastSeq || p.pending_revision < _pendingRevision))) {
+          return fetchBootstrap('full');
+        }
+        applyBootstrapState(p, operatorRevisions);
+        const stateChanged = previous && (previous._rev || 0) !== revision;
+        if (mode !== 'none' && !applySnapshotPayload(p, true)) return _bootFull;
+        // Config/model changes precede the snapshot's own revision gate and
+        // must not depend on optional operator snapshots to refresh the log.
+        // A full replacement already rendered; only in-place state needs this.
+        if (stateChanged && lastData === previous) scheduleRenderLive();
+        if (mode === 'full') startStream(lastSeq, feedId);
+      }
+      return p;
+    })
+    .catch(() => {
+      // Failed boot/resync falls back to the stream's full snapshot. Only the
+      // latest mandatory replacement may reopen; an older failure stays inert.
+      if (mode === 'full' && _bootFull === request && !dashboardReloading) startStream(0, feedId);
+      return null;
+    })
+    .finally(() => { if (_bootFull === request) _bootFull = null; })
+    .then(p => { if (after && !dashboardReloading) after(p); return p; });
+  if (mode === 'full') _bootFull = request;
+  return request;
+}
+// Plugin management is core-owned. The guest supplies text descriptors only;
+// every control, label and action in this card is authored here.
+let pluginAdminDoc = null;
+let pluginCandidates = [];
+
+function pluginStatusText(message, kind = '') {
+  const el = $('plugin-status');
+  if (!el) return;
+  el.textContent = String(message || '');
+  if (kind) el.dataset.kind = kind;
+  else delete el.dataset.kind;
+}
+
+function pluginConfigText(cfg) {
+  if (!cfg || typeof cfg !== 'object') return '';
+  const bits = [];
+  bits.push(cfg.enabled ? 'runtime on' : 'runtime off');
+  bits.push(cfg.downloads_enabled ? 'downloads on' : 'downloads off');
+  bits.push(cfg.trust_file ? 'signed' : 'unsigned dev');
+  bits.push(cfg.lock_file ? 'pins on' : 'pins off');
+  return bits.join(' · ');
+}
+
+function pluginActionButton(action, id, label) {
+  return '<button type="button" class="btn plug-btn" data-plug-action="' + escapeHtml(action) +
+    '" data-plug-id="' + escapeHtml(id) + '">' + escapeHtml(label) + '</button>';
+}
+
+function renderPluginCandidates() {
+  const box = $('plugin-updates');
+  if (!box) return;
+  if (!pluginCandidates.length) { box.innerHTML = ''; return; }
+  box.innerHTML = pluginCandidates.map(c => {
+    const id = escapeHtml(String(c.id || 'plugin'));
+    const from = escapeHtml(String(c.current_version || '?'));
+    const to = escapeHtml(String(c.version || '?'));
+    return '<div class="plug-update">update available · ' + id + ' ' + from + ' → ' + to + '</div>';
+  }).join('');
+}
+
+let activeDashboardView = 'overview';
+let opencodeState = null;
+let focusAutoActivated = false;
+
+function setDashboardView(view) {
+  const next = view === 'opencode' || view === 'focus' ? view : 'overview';
+  activeDashboardView = next;
+  for (const panel of document.querySelectorAll('[data-view-panel]')) {
+    panel.hidden = panel.dataset.viewPanel !== next;
+  }
+  for (const tab of document.querySelectorAll('[data-view]')) {
+    tab.setAttribute('aria-selected', tab.dataset.view === next ? 'true' : 'false');
+  }
+  if (next === 'opencode') renderOpenCodeTab();
+  if (next === 'focus') renderFocusTab();
+}
+function opencodePanel(state) {
+  const descriptors = Array.isArray(state?.descriptors) ? state.descriptors : [];
+  for (const desc of descriptors) {
+    if (desc?.plugin_id !== 'opencode-usage-limits') continue;
+    const panels = Array.isArray(desc.panels) ? desc.panels : [];
+    const panel = panels.find(p => p?.id === 'opencode-usage-limits');
+    if (panel) return panel;
+  }
+  return null;
+}
+
+// A bounded, generic descriptor lookup. The core chooses which plugin and
+// panel a layout hint may compose; guests only publish escaped text data.
+function pluginPanel(state, pluginID, panelID) {
+  const descriptors = Array.isArray(state?.descriptors) ? state.descriptors : [];
+  for (const desc of descriptors) {
+    if (String(desc?.plugin_id || '') !== pluginID) continue;
+    const panels = Array.isArray(desc.panels) ? desc.panels : [];
+    const panel = panels.find(p => String(p?.id || '') === panelID);
+    if (panel) return panel;
+  }
+  return null;
+}
+
+function focusDescriptor(state) {
+  const descriptors = Array.isArray(state?.descriptors) ? state.descriptors : [];
+  for (const desc of descriptors) {
+    const panels = Array.isArray(desc?.panels) ? desc.panels : [];
+    for (const panel of panels) {
+      const data = panel?.data && typeof panel.data === 'object' ? panel.data : {};
+      if (data.view === 'focus') return { desc: desc, panel: panel, data: data };
+    }
+  }
+  return null;
+}
+
+function opencodeField(label, value) {
+  return '<div class="oc-field"><span class="oc-label">' + escapeHtml(label) +
+    '</span><span class="oc-value">' + escapeHtml(value == null || value === '' ? '-' : value) + '</span></div>';
+}
+
+function parseOpenCodeQuota(value) {
+  const match = /used:\s*([\d.]+)%\s*(?:\||·|Â·)\s*left:\s*([\d.]+)%\s*(?:\||·|Â·)\s*limited:\s*(true|false)\s*(?:\||·|Â·)\s*resets:\s*(.+)$/.exec(String(value == null ? '' : value));
+  if (!match) return null;
+  const used = Math.max(0, Math.min(100, Number(match[1]) || 0));
+  return { used: used, left: 100 - used, limited: match[3] === 'true', resets: match[4].trim() };
+}
+
+function opencodeQuotaCard(label, value, tone) {
+  const quota = parseOpenCodeQuota(value);
+  if (!quota) {
+    return '<div class="oc-quota oc-quota-empty ' + tone + '"><span class="oc-quota-label">' +
+      escapeHtml(label) + '</span><span class="oc-muted">unavailable</span></div>';
+  }
+  return '<div class="oc-quota ' + tone + '">' +
+    '<div class="oc-quota-top"><span class="oc-quota-label">' + escapeHtml(label) + '</span>' +
+    (quota.limited ? '<span class="oc-quota-badge">limited</span>' : '') + '</div>' +
+    '<div class="oc-quota-value">' + escapeHtml(String(quota.left)) + '% <span>left</span></div>' +
+    '<div class="oc-quota-track"><div class="oc-quota-fill" style="width:' + quota.used + '%"></div></div>' +
+    '<div class="oc-quota-meta">' + escapeHtml(quota.resets) + '</div></div>';
+}
+
+function renderOpenCodeTab() {
+  const status = $('opencode-status');
+  const intro = $('opencode-intro');
+  const grid = $('opencode-grid');
+  const detail = $('opencode-detail');
+  if (!status || !intro || !grid || !detail) return;
+  const modules = Array.isArray(opencodeState?.modules) ? opencodeState.modules : [];
+  const module = modules.find(m => m?.id === 'opencode-usage-limits');
+  const panel = opencodePanel(opencodeState);
+  if (!module) {
+    status.textContent = 'not installed';
+    intro.textContent = 'Install the opencode-usage-limits plugin to populate this view.';
+    grid.innerHTML = '';
+    detail.innerHTML = '';
+    return;
+  }
+  if (!panel) {
+    const failures = Number(module.failures || 0);
+    status.textContent = [module.version, failures ? failures + ' failures' : 'waiting'].filter(Boolean).join(' · ');
+    intro.textContent = 'Waiting for the first recorded OpenCode request.';
+    grid.innerHTML = '';
+    detail.innerHTML = '';
+    return;
+  }
+  const failures = Number(module.failures || 0);
+  const data = panel.data && typeof panel.data === 'object' ? panel.data : {};
+  status.textContent = [module.version, failures ? failures + ' failures' : 'healthy'].filter(Boolean).join(' · ');
+  intro.textContent = panel.title || 'OpenCode Go usage';
+  const fields = [
+    ['provider', data.provider], ['requests', data.requests],
+    ['input tokens', data.input_tokens], ['output tokens', data.output_tokens],
+    ['cost', data.cost], ['rate limited', data.rate_limited],
+    ['header remaining', data.remaining], ['last model', data.last_model],
+  ];
+  const quotaCards = [
+    ['rolling', data.rolling, 'oc-quota-rolling'],
+    ['weekly', data.weekly, 'oc-quota-weekly'],
+    ['monthly', data.monthly, 'oc-quota-monthly'],
+  ].map(parts => opencodeQuotaCard(parts[0], parts[1], parts[2])).join('');
+  const quotaNote = data.quota_status === 'ok'
+    ? ''
+    : '<div class="oc-quota-note">Quota source unavailable. Allow the plugin\'s fetch host and reload after a request.</div>';
+  grid.innerHTML = fields.map(([label, value]) => opencodeField(label, value)).join('') +
+    '<div class="oc-quota-grid">' + quotaCards + '</div>' + quotaNote;
+  const tools = [];
+  for (const desc of Array.isArray(opencodeState?.descriptors) ? opencodeState.descriptors : []) {
+    if (desc?.plugin_id !== 'opencode-usage-limits') continue;
+    for (const tool of Array.isArray(desc.tools) ? desc.tools : []) {
+      tools.push('<div class="oc-tool">' + escapeHtml(String(tool?.name || '')) +
+        '<span>' + escapeHtml(String(tool?.description || tool?.capability || '')) + '</span></div>');
+    }
+  }
+  const modelList = String(data.model_list || '').split(',').map(s => s.trim()).filter(Boolean);
+  const models = modelList.length
+    ? '<div class="oc-models">' + modelList.map(m => '<span>' + escapeHtml(m) + '</span>').join('') + '</div>'
+    : '';
+  detail.innerHTML = '<div class="oc-section"><h3>Declared tool</h3>' +
+    (tools.join('') || '<span class="oc-muted">none</span>') + '</div>' +
+    '<div class="oc-section"><h3>Models</h3>' + (models || '<span class="oc-muted">none</span>') + '</div>' +
+    '<div class="oc-section"><h3>Config view</h3>' +
+    opencodeField('schema', data.config_schema) + opencodeField('values', data.config_values) + '</div>';
+}
+
+// A plugin-declared layout view. It composes the plugin's own bounded summary
+// with the descriptor it asks for; no guest HTML or JS is ever interpolated.
+function renderFocusTab() {
+  const status = $('focus-status');
+  const intro = $('focus-intro');
+  const grid = $('focus-grid');
+  const detail = $('focus-detail');
+  if (!status || !intro || !grid || !detail) return;
+  const layout = focusDescriptor(opencodeState);
+  if (!layout) {
+    status.textContent = 'not installed';
+    intro.textContent = 'Install the dashboard-focus plugin to enable this view.';
+    grid.innerHTML = '';
+    detail.innerHTML = '';
+    return;
+  }
+  const data = layout.data;
+  const includeID = String(data.include_plugin || '');
+  const includePanel = String(data.include_panel || includeID);
+  const source = includeID ? pluginPanel(opencodeState, includeID, includePanel) : null;
+  const sourceData = source?.data && typeof source.data === 'object' ? source.data : {};
+  const modules = Array.isArray(opencodeState?.modules) ? opencodeState.modules : [];
+  const sourceModule = modules.find(m => String(m?.id || '') === includeID);
+  status.textContent = [layout.desc.plugin_id, data.layout_revisions ? 'rev ' + data.layout_revisions : '']
+    .filter(Boolean).join(' · ');
+  intro.textContent = data.heading || layout.panel.title || 'Focus view';
+  const fields = [
+    ['arrange', data.arrange],
+    ['plugin requests', data.requests],
+    ['models', data.models],
+    ['errors', data.errors],
+    ['tokens in/out', String(data.input_tokens || '0') + ' / ' + String(data.output_tokens || '0')],
+    ['last model', data.last_model],
+    ['included plugin', includeID || 'none'],
+    ['included panel', source ? (source.title || includePanel) : 'waiting'],
+    ['quota source', sourceModule
+      ? [sourceModule.version, sourceModule.failures ? sourceModule.failures + ' failures' : 'healthy'].join(' · ')
+      : 'not installed'],
+    ['quota status', sourceData.quota_status || 'unavailable'],
+    ['provider', sourceData.provider],
+    ['cost', sourceData.cost],
+  ];
+  const quotaCards = [
+    ['rolling', sourceData.rolling, 'oc-quota-rolling'],
+    ['weekly', sourceData.weekly, 'oc-quota-weekly'],
+    ['monthly', sourceData.monthly, 'oc-quota-monthly'],
+  ].map(parts => opencodeQuotaCard(parts[0], parts[1], parts[2])).join('');
+  const quotaNote = source && sourceData.quota_status === 'ok'
+    ? ''
+    : '<div class="oc-quota-note">Quota source unavailable. Allow the OpenCode fetch host and reload after a request.</div>';
+  grid.innerHTML = fields.map(([label, value]) => opencodeField(label, value)).join('') +
+    '<div class="oc-quota-grid">' + quotaCards + '</div>' + quotaNote;
+  const descriptors = Array.isArray(opencodeState?.descriptors) ? opencodeState.descriptors : [];
+  const descriptorRows = descriptors.map(desc => {
+    const titles = (Array.isArray(desc?.panels) ? desc.panels : [])
+      .map(panel => String(panel?.title || panel?.id || '')).filter(Boolean);
+    return '<div class="oc-tool">' + escapeHtml(String(desc?.plugin_id || 'plugin')) +
+      '<span>' + escapeHtml(titles.join(', ') || 'no panels') + '</span></div>';
+  }).join('');
+  detail.innerHTML = '<div class="oc-section"><h3>Loaded plugins</h3>' +
+    (descriptorRows || '<span class="oc-muted">none</span>') + '</div>' +
+    '<div class="oc-section"><h3>Layout note</h3><span class="oc-muted">' +
+    escapeHtml(String(data.note || '')) + '</span></div>';
+}
+
+function applyPluginState(state) {
+  opencodeState = state || null;
+  const pane = $('plugins-card');
+  const list = $('plugins-list');
+  const modules = Array.isArray(state?.modules) ? state.modules : [];
+  // The pane lives in Settings. Populate it only while revealed; the focus
+  // view below always runs because it drives the dashboard, not the pane.
+  if (pane && list && !pane.hidden) {
+    const config = $('plugins-config');
+    if (config && pluginAdminDoc && pluginAdminDoc.config) {
+      config.textContent = pluginConfigText(pluginAdminDoc.config);
+    }
+    const rows = [];
+    for (const mod of modules) {
+      if (!mod || typeof mod !== 'object') continue;
+      const id = String(mod.id || mod.module || 'plugin');
+      const caps = Array.isArray(mod.capabilities) ? mod.capabilities.join(', ') : '';
+      const meta = [mod.version, mod.abi, caps].filter(Boolean).join(' · ');
+      const failures = Number(mod.failures || 0);
+      rows.push('<div class="plug-row plug-installed"><span class="plug-name">' + escapeHtml(id) + '</span>' +
+        (meta || failures ? '<span class="plug-meta">' + escapeHtml(meta + (failures ? ' · ' + failures + ' failures' : '')) + '</span>' : '') +
+        '<span class="plug-actions">' +
+        pluginActionButton('verify', id, 'Verify') +
+        pluginActionButton('pin', id, 'Pin') +
+        pluginActionButton('updates', id, 'Check update') +
+        pluginActionButton('update', id, 'Update') +
+        pluginActionButton('rollback', id, 'Rollback') +
+        pluginActionButton('uninstall', id, 'Uninstall') +
+        '</span></div>');
+    }
+    const descriptors = Array.isArray(state?.descriptors) ? state.descriptors : [];
+    for (const desc of descriptors) {
+      for (const tool of Array.isArray(desc?.tools) ? desc.tools : []) {
+        rows.push('<div class="plug-row plug-desc"><span class="plug-tag">tool</span><span>' + escapeHtml(String(tool?.name || '')) + '</span></div>');
+      }
+      for (const panel of Array.isArray(desc?.panels) ? desc.panels : []) {
+        rows.push('<div class="plug-row plug-desc"><span class="plug-tag">panel</span><span>' + escapeHtml(String(panel?.title || '')) + '</span></div>');
+      }
+    }
+    if (!rows.length) rows.push('<div class="plug-empty">No plugins installed.</div>');
+    list.innerHTML = rows.join('');
+    renderPluginCandidates();
+  }
+  if (!focusAutoActivated && focusDescriptor(state) && activeDashboardView === 'overview') {
+    focusAutoActivated = true;
+    setDashboardView('focus');
+  }
+  if (activeDashboardView === 'opencode') renderOpenCodeTab();
+  if (activeDashboardView === 'focus') renderFocusTab();
+}
+function pluginMutationReport(report, fallback) {
+  if (!report || typeof report !== 'object') { pluginStatusText(fallback, 'error'); return; }
+  const bits = [];
+  if (report.id) bits.push(String(report.id));
+  if (report.ok !== undefined) bits.push(report.ok ? 'verify ok' : 'verify failed');
+  if (Array.isArray(report.pinned)) bits.push('pinned ' + report.pinned.length);
+  if (report.from_version && report.to_version) bits.push(String(report.from_version) + ' → ' + String(report.to_version));
+  if (report.version) bits.push(String(report.version));
+  if (report.signature) bits.push(String(report.signature));
+  const restart = !!report.restart_required;
+  if (restart) bits.push('restart required');
+  pluginStatusText(bits.join(' · ') || fallback, restart ? 'restart' : 'ok');
+}
+
+async function fetchPluginAdmin() {
+  try {
+    const doc = await operatorJson('/admin/plugins');
+    if (!doc || typeof doc !== 'object' || !doc.status) throw new Error('invalid plugin status');
+    pluginAdminDoc = doc;
+    applyPluginState(doc.status);
+    return doc;
+  } catch (err) {
+    pluginStatusText(String(err && err.message ? err.message : 'plugin status failed'), 'error');
+    return null;
+  }
+}
+
+function pluginJSONPost(url, body, fallback) {
+  return operatorJsonBody(url, {
+    method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body),
+  }, fallback);
+}
+
+async function pluginInstallFile() {
+  const input = $('plugin-file');
+  const file = input && input.files ? input.files[0] : null;
+  if (!file) { pluginStatusText('choose a .mvplugin file', 'error'); return; }
+  pluginStatusText('installing ' + file.name);
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const report = await operatorJsonBody('/admin/plugins/install', { method: 'POST', body: form }, 'plugin install failed');
+    pluginMutationReport(report, 'installed');
+    input.value = '';
+    await fetchPluginAdmin();
+  } catch (err) {
+    pluginStatusText(String(err && err.message ? err.message : 'plugin install failed'), 'error');
+  }
+}
+
+async function pluginInstallSource() {
+  const input = $('plugin-source');
+  const source = input ? input.value.trim() : '';
+  if (!source) { pluginStatusText('paste a GitHub release link', 'error'); return; }
+  pluginStatusText('fetching ' + source);
+  try {
+    const report = await pluginJSONPost('/admin/plugins/install', { source }, 'plugin install failed');
+    pluginMutationReport(report, 'installed');
+    await fetchPluginAdmin();
+  } catch (err) {
+    pluginStatusText(String(err && err.message ? err.message : 'plugin install failed'), 'error');
+  }
+}
+
+function pluginInboxSummary(report) {
+  if (!report || typeof report !== 'object') return 'inbox scan failed';
+  const bits = [];
+  bits.push('scanned ' + Number(report.scanned || 0));
+  bits.push('installed ' + (Array.isArray(report.installed) ? report.installed.length : 0));
+  if (Array.isArray(report.failed) && report.failed.length) {
+    bits.push('failed ' + report.failed.length + ' · ' + String(report.failed[0].file || 'file') + ': ' + String(report.failed[0].error || 'invalid'));
+  }
+  if (report.restart_required) bits.push('restart required');
+  return bits.join(' · ');
+}
+
+async function pluginScanInbox() {
+  pluginStatusText('scanning inbox');
+  try {
+    const report = await pluginJSONPost('/admin/plugins/install', { action: 'install_inbox' }, 'inbox scan failed');
+    pluginStatusText(pluginInboxSummary(report), report && report.restart_required ? 'restart' : 'ok');
+    await fetchPluginAdmin();
+  } catch (err) {
+    pluginStatusText(String(err && err.message ? err.message : 'inbox scan failed'), 'error');
+  }
+}
+
+async function pluginRunAction(action, id) {
+  if (!id) return;
+  const sourceInput = $('plugin-source');
+  const source = sourceInput ? sourceInput.value.trim() : '';
+  const caps = $('plugin-confirm-caps');
+  pluginStatusText(action + ' ' + id);
+  try {
+    let report;
+    switch (action) {
+      case 'verify':
+        report = await pluginJSONPost('/admin/plugins', { action: 'verify' }, 'verify failed');
+        break;
+      case 'pin':
+        report = await pluginJSONPost('/admin/plugins', { action: 'pin' }, 'pin failed');
+        break;
+      case 'updates': {
+        const doc = await operatorJson('/admin/plugins/updates/check?id=' + encodeURIComponent(id));
+        pluginCandidates = Array.isArray(doc?.candidates) ? doc.candidates : [];
+        renderPluginCandidates();
+        pluginStatusText(pluginCandidates.length ? 'update found' : 'no updates', pluginCandidates.length ? 'ok' : '');
+        return;
+      }
+      case 'update': {
+        const body = { id };
+        if (source) body.source = source;
+        if (caps && caps.checked) body.confirm_capability_change = true;
+        report = await pluginJSONPost('/admin/plugins/update', body, 'update failed');
+        break;
+      }
+      case 'rollback':
+        report = await pluginJSONPost('/admin/plugins/rollback', { id }, 'rollback failed');
+        break;
+      case 'uninstall':
+        if (!window.confirm('Uninstall plugin ' + id + '?')) return;
+        report = await pluginJSONPost('/admin/plugins/uninstall', { id }, 'uninstall failed');
+        break;
+      default:
+        return;
+    }
+    pluginMutationReport(report, action + ' done');
+    await fetchPluginAdmin();
+  } catch (err) {
+    pluginStatusText(String(err && err.message ? err.message : action + ' failed'), 'error');
+  }
+}
+
+function applyBootstrapState(p, revisions = captureOperatorRevisions()) {
+  applyDashValues(p.dash);
+  applyModelCanon(p.model_canon, true);
+  if (p.kpi) {
+    // The 5s poll usually returns the same aggregate; swapping it and
+    // bumping the revision would re-run the whole derivation (and every
+    // scoped log scan) for nothing. The KPI document is small.
+    const next = JSON.stringify(p.kpi);
+    const prev = kpiAgg === null || kpiAgg === undefined ? '' : JSON.stringify(kpiAgg);
+    if (next !== prev) {
+      kpiAgg = p.kpi;
+      // kpiHtml lives inside the memoized derivation - a kpiAgg swap alone
+      // (mode 'none': the SSE snapshot already delivered the records) must
+      // invalidate it or renderBand would repaint the old aggregate.
+      bumpData();
+    }
+  }
+  if (p.pause) applyPauseState(p.pause, revisions.pause);
+  if (p.throttle) applyThrottleState(p.throttle, revisions.throttle);
+  if (p.debug) applyDebugState(p.debug, revisions.debug);
+  applyRestartState(p.restart);
+  applyStormState(p.storm);
+  if (p.storage && typeof p.storage.enabled === 'boolean' && Number.isSafeInteger(p.storage.dropped) && p.storage.dropped >= 0) {
+    storageState = p.storage;
+    refreshFooterState();
+  }
+  const pluginState = p.plugins && Array.isArray(p.plugins.modules) ? p.plugins : pluginAdminDoc?.status;
+  applyPluginState(pluginState);
+  if (lastData) { renderBand(); updateScopeLine(); }
+}
+function bootDashboard() {
+  fetchBootstrap('full');
+  fetchPluginAdmin();
+}
+// The plugin pane is rendered by settings.js after first load, so its
+// controls are wired through delegation at the document root.
+document.addEventListener('click', e => {
+  const card = e.target.closest && e.target.closest('#plugins-card');
+  if (!card) return;
+  const action = e.target.closest('[data-plug-action]');
+  if (action) {
+    pluginRunAction(action.dataset.plugAction, action.dataset.plugId);
+    return;
+  }
+  if (e.target.closest('#plugin-install-file')) pluginInstallFile();
+  else if (e.target.closest('#plugin-scan-inbox')) pluginScanInbox();
+  else if (e.target.closest('#plugin-install-source')) pluginInstallSource();
+  else if (e.target.closest('#plugin-refresh')) fetchPluginAdmin();
+});
+watchGallery(); // self-correcting gallery sizing from the very first paint
+
+const viewTabs = $('view-tabs');
+viewTabs?.addEventListener('click', e => {
+  const tab = e.target.closest('[data-view]');
+  if (tab && viewTabs.contains(tab)) setDashboardView(tab.dataset.view);
+});
+setDashboardView('overview');
+bootDashboard();
+if (window.isSecureContext && 'serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' }).catch(() => {});
+}
